@@ -56,10 +56,11 @@ __all__ = [
     "gpu_percent",
     "proc_info",
     "sample_gpu",
+    "snapshot",
     "system_gpu_stats",
 ]
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 
 def gpu_percent(pid: int = 0, interval: float = 0.5) -> float:
@@ -113,6 +114,105 @@ def sample_gpu(pids: list[int] | None = None, interval: float = 0.5) -> dict[int
         else:
             result[pid] = min(((ns2 - ns1) / interval_ns) * 100.0, 100.0)
     return result
+
+
+def snapshot(interval: float = 1.0) -> list[dict]:
+    """One-call GPU utilization snapshot for all processes.
+
+    Auto-discovers every process using the GPU, measures utilization
+    over ``interval`` seconds, and returns ready-to-use results sorted
+    by GPU % descending. No PID lookup needed.
+
+    Args:
+        interval: Measurement window in seconds (default 1.0).
+
+    Returns:
+        List of dicts, one per GPU-active process, sorted by gpu_percent::
+
+            [
+                {
+                    'pid': 4245,
+                    'name': 'python3.12',
+                    'gpu_percent': 85.7,
+                    'gpu_ns': 1714800000,      # GPU ns used during interval
+                    'cpu_percent': 102.3,       # can exceed 100% (multi-core)
+                    'memory_mb': 2048.5,        # physical footprint
+                    'energy_w': 12.3,           # power draw in watts
+                    'threads': 24,
+                },
+                ...
+            ]
+
+    Example::
+
+        from macos_gpu_proc import snapshot
+
+        for proc in snapshot():
+            print(f"{proc['name']:20s}  GPU {proc['gpu_percent']:5.1f}%  "
+                  f"CPU {proc['cpu_percent']:5.1f}%  {proc['memory_mb']:.0f}MB")
+    """
+    # First sample
+    clients1 = {}
+    for c in gpu_clients():
+        pid = c["pid"]
+        if pid not in clients1:
+            clients1[pid] = {"name": c["name"], "gpu_ns": 0}
+        clients1[pid]["gpu_ns"] += c["gpu_ns"]
+
+    cpu1 = {}
+    energy1 = {}
+    for pid in clients1:
+        ns = cpu_time_ns(pid)
+        cpu1[pid] = ns if ns >= 0 else 0
+        info = proc_info(pid)
+        energy1[pid] = info["energy_nj"] if info else 0
+
+    _time.sleep(interval)
+
+    # Second sample
+    clients2 = {}
+    for c in gpu_clients():
+        pid = c["pid"]
+        if pid not in clients2:
+            clients2[pid] = {"name": c["name"], "gpu_ns": 0}
+        clients2[pid]["gpu_ns"] += c["gpu_ns"]
+
+    interval_ns = interval * 1_000_000_000
+    results = []
+    for pid, c2 in clients2.items():
+        c1 = clients1.get(pid)
+        gpu_delta = c2["gpu_ns"] - (c1["gpu_ns"] if c1 else c2["gpu_ns"])
+        if gpu_delta <= 0 and c1 is None:
+            continue
+
+        cpu2 = cpu_time_ns(pid)
+        cpu2 = cpu2 if cpu2 >= 0 else 0
+        cpu_delta = cpu2 - cpu1.get(pid, cpu2)
+
+        info = proc_info(pid)
+        energy2 = info["energy_nj"] if info else 0
+        energy_delta = energy2 - energy1.get(pid, energy2)
+
+        gpu_pct = min(gpu_delta / interval_ns * 100, 100) if interval_ns > 0 else 0
+        cpu_pct = cpu_delta / interval_ns * 100 if interval_ns > 0 else 0
+        power_w = energy_delta / (interval * 1e9) if interval > 0 else 0
+
+        if gpu_pct < 0.05 and gpu_delta <= 0:
+            continue
+
+        results.append({
+            "pid": pid,
+            "name": c2["name"],
+            "gpu_percent": round(gpu_pct, 1),
+            "gpu_ns": gpu_delta,
+            "cpu_percent": round(cpu_pct, 1),
+            "memory_mb": round(info["memory"] / (1024 * 1024), 1) if info else 0,
+            "energy_w": round(power_w, 2),
+            "threads": info["threads"] if info else 0,
+        })
+
+    results.sort(key=lambda r: r["gpu_percent"], reverse=True)
+    return results
 
 
 class GpuMonitor:

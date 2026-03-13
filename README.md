@@ -13,51 +13,27 @@ pip install macos-gpu-proc
 ## Quick Start
 
 ```python
-from macos_gpu_proc import gpu_clients, gpu_time_ns, proc_info, system_gpu_stats
-import time
+from macos_gpu_proc import snapshot
 
-# Auto-discover all processes using the GPU — no PIDs needed
-for c in gpu_clients():
-    print(f"PID {c['pid']} ({c['name']}): {c['gpu_ns']/1e9:.1f}s GPU time")
+# One call — auto-discovers all GPU processes, returns utilization %
+for proc in snapshot():
+    print(f"{proc['name']:20s}  GPU {proc['gpu_percent']:5.1f}%  "
+          f"CPU {proc['cpu_percent']:5.1f}%  {proc['memory_mb']:.0f}MB  "
+          f"{proc['energy_w']:.1f}W")
 
 # Example output:
-#   PID 4245 (python3.12): 123.6s GPU time
-#   PID  418 (WindowServer): 28.8s GPU time
-#   PID  729 (Code Helper (GPU): 9.6s GPU time
+#   python3.12            GPU  85.7%  CPU 102.3%  2048MB  12.3W
+#   WindowServer          GPU   3.2%  CPU   0.1%    45MB   0.4W
+#   Code Helper (GPU      GPU   1.9%  CPU   0.1%   670MB   0.1W
 ```
 
-### GPU Utilization %
-
-All values are cumulative — take two snapshots and divide by elapsed time:
-
-```python
-# Pick a PID from gpu_clients(), or use your own
-clients = gpu_clients()
-pid = clients[0]['pid']  # highest GPU user
-
-t1 = gpu_time_ns(pid)
-time.sleep(2)
-t2 = gpu_time_ns(pid)
-
-gpu_pct = (t2 - t1) / (2 * 1e9) * 100
-print(f"PID {pid} GPU: {gpu_pct:.1f}%")
-```
-
-### Per-Process Stats
-
-`proc_info(pid)` returns CPU, memory, energy, disk I/O, and thread count for any process — no sudo needed for same-user processes:
-
-```python
-info = proc_info(pid)
-print(f"CPU: {info['cpu_ns']/1e9:.1f}s")
-print(f"Memory: {info['memory']/1e6:.0f}MB")
-print(f"Energy: {info['energy_nj']/1e9:.1f}J")
-print(f"Threads: {info['threads']}")
-```
+Each dict in the list contains: `pid`, `name`, `gpu_percent`, `cpu_percent`, `memory_mb`, `energy_w`, `threads`, and `gpu_ns`.
 
 ### System-Wide GPU
 
 ```python
+from macos_gpu_proc import system_gpu_stats
+
 stats = system_gpu_stats()
 print(f"{stats['model']} ({stats['gpu_core_count']} cores)")
 print(f"Device utilization: {stats['device_utilization']}%")
@@ -83,6 +59,20 @@ with GpuMonitor() as mon:
 print(mon.summary())  # {'gpu_pct_avg': 42.1, 'gpu_pct_max': 87.3, ...}
 ```
 
+### Low-Level Access
+
+```python
+from macos_gpu_proc import gpu_clients, gpu_time_ns, proc_info
+
+# All GPU clients (raw cumulative data)
+for c in gpu_clients():
+    print(f"PID {c['pid']} ({c['name']}): {c['gpu_ns']/1e9:.1f}s GPU time")
+
+# Per-process stats (CPU, memory, energy, disk I/O, threads)
+info = proc_info(1234)
+print(f"Memory: {info['memory']/1e6:.0f}MB, Energy: {info['energy_nj']/1e9:.1f}J")
+```
+
 ## CLI
 
 ```bash
@@ -95,6 +85,12 @@ gpu-proc --pid 1234   # monitor specific PID
 ```
 
 ## API Reference
+
+### Python API
+
+| Function | Description |
+|----------|-------------|
+| `snapshot(interval=1.0)` | **One call does it all** — returns `[{'pid', 'name', 'gpu_percent', 'cpu_percent', 'memory_mb', 'energy_w', ...}]` |
 
 ### C Extension Functions
 
