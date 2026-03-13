@@ -1,0 +1,14 @@
+
+[all]
+psutil
+textual>=0.40
+
+[children]
+psutil
+
+[cli]
+psutil
+
+[tui]
+textual>=0.40
+psutil
