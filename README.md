@@ -117,7 +117,7 @@ CPU/memory/energy stats come from `proc_pid_rusage(RUSAGE_INFO_V6)` and `proc_pi
 
 ## Requirements
 
-- macOS with Apple Silicon (M1/M2/M3/M4)
+- macOS with Apple Silicon (M1/M2/M3/M4/M5)
 - Python 3.9+
 - No external dependencies for core functionality
 

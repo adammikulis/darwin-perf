@@ -21,7 +21,7 @@ classifiers = [
     "Topic :: System :: Monitoring",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-keywords = ["macos", "gpu", "monitoring", "apple-silicon", "metal", "mlx", "pytorch", "mps"]
+keywords = ["macos", "gpu", "monitoring", "apple-silicon", "metal", "mlx", "pytorch", "mps", "m1", "m2", "m3", "m4", "m5"]
 
 [project.optional-dependencies]
 children = ["psutil"]
