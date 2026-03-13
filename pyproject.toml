@@ -27,7 +27,8 @@ keywords = ["macos", "gpu", "monitoring", "apple-silicon", "metal", "mlx", "pyto
 children = ["psutil"]
 cli = ["psutil"]
 tui = ["textual>=0.40", "psutil"]
-all = ["psutil", "textual>=0.40"]
+gui = ["pywebview>=5.0", "psutil"]
+all = ["psutil", "textual>=0.40", "pywebview>=5.0"]
 
 [project.scripts]
 gpu-proc = "macos_gpu_proc.cli:main"

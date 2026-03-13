@@ -69,7 +69,15 @@ def main() -> None:
                         help="Print one snapshot and exit")
     parser.add_argument("--tui", action="store_true",
                         help="Launch rich terminal UI with sparkline graphs")
+    parser.add_argument("--gui", action="store_true",
+                        help="Launch native floating window monitor")
     args = parser.parse_args()
+
+    # GUI mode — native floating window
+    if args.gui:
+        from macos_gpu_proc.gui import run_gui
+        run_gui(interval=args.interval)
+        return
 
     # TUI mode
     if args.tui:
