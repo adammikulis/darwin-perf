@@ -1,11 +1,10 @@
 """gpu-proc: Live per-process GPU utilization monitor for macOS.
 
 Like `top` or `htop`, but for GPU. Auto-discovers all processes using
-the GPU, ranked by utilization. Updates live.
+the GPU via IORegistry — no sudo needed.
 
 Usage:
-    gpu-proc              # monitor all GPU-active processes (needs sudo)
-    gpu-proc --self       # monitor only this process (no sudo needed)
+    gpu-proc              # monitor all GPU-active processes
     gpu-proc --pid 1234   # monitor specific PID
     gpu-proc --top 10     # show top 10 GPU consumers
     gpu-proc -i 1         # update every 1 second
@@ -19,35 +18,47 @@ import signal
 import sys
 import time
 
-
-def _get_all_pids() -> list[int]:
-    """Get all running PIDs via psutil."""
-    import psutil
-    return [p.pid for p in psutil.process_iter(["pid"])]
+from collections import defaultdict
 
 
-def _pid_name(pid: int) -> str:
-    """Get process name for a PID."""
-    try:
-        import psutil
-        return psutil.Process(pid).name()
-    except Exception:
-        return "?"
+def _format_table(
+    rows: list[tuple[int, str, float, float, float, float]],
+) -> str:
+    """Format rows as a table string.
 
-
-def _format_table(rows: list[tuple[int, str, float]], total_gpu: float | None) -> str:
-    """Format rows as a table string."""
+    Each row: (pid, name, gpu_pct, cpu_pct, mem_mb, real_mem_mb)
+    """
     lines = []
-    lines.append(f"{'PID':>8}  {'GPU %':>7}  {'Process'}")
-    lines.append(f"{'─' * 8}  {'─' * 7}  {'─' * 30}")
-    for pid, name, pct in rows:
-        bar_len = int(min(pct, 100) / 5)  # 20 chars = 100%
+    lines.append(
+        f"{'PID':>8}  {'GPU %':>7}  {'CPU %':>7}  {'Memory':>9}  {'Real Mem':>9}  {'Process'}"
+    )
+    lines.append(
+        f"{'─' * 8}  {'─' * 7}  {'─' * 7}  {'─' * 9}  {'─' * 9}  {'─' * 25}"
+    )
+    for pid, name, gpu_pct, cpu_pct, mem_mb, real_mem_mb in rows:
+        bar_len = int(min(gpu_pct, 100) / 5)  # 20 chars = 100%
         bar = "█" * bar_len + "░" * (20 - bar_len)
-        lines.append(f"{pid:>8}  {pct:>6.1f}%  {name:<20}  {bar}")
-    if total_gpu is not None:
-        lines.append(f"{'':>8}  {'─' * 7}")
-        lines.append(f"{'Total':>8}  {total_gpu:>6.1f}%")
+        lines.append(
+            f"{pid:>8}  {gpu_pct:>6.1f}%  {cpu_pct:>6.1f}%  "
+            f"{mem_mb:>7.1f}MB  {real_mem_mb:>7.1f}MB  {name:<20}  {bar}"
+        )
     return "\n".join(lines)
+
+
+def _snapshot() -> dict[int, dict]:
+    """Take a snapshot of all GPU clients with their GPU time and names.
+
+    Returns dict: pid -> {'name': str, 'gpu_ns': int}
+    """
+    from macos_gpu_proc._native import gpu_clients
+
+    by_pid: dict[int, dict] = {}
+    for c in gpu_clients():
+        pid = c["pid"]
+        if pid not in by_pid:
+            by_pid[pid] = {"name": c["name"], "gpu_ns": 0}
+        by_pid[pid]["gpu_ns"] += c["gpu_ns"]
+    return by_pid
 
 
 def main() -> None:
@@ -55,61 +66,60 @@ def main() -> None:
         prog="gpu-proc",
         description="Live per-process GPU utilization monitor for macOS.",
     )
-    parser.add_argument("--self", action="store_true", dest="self_only",
-                        help="Monitor only the current process (no sudo)")
-    parser.add_argument("--pid", type=int, nargs="+", default=None,
-                        help="Monitor specific PIDs")
-    parser.add_argument("--top", type=int, default=20,
-                        help="Show top N GPU consumers (default: 20)")
-    parser.add_argument("-i", "--interval", type=float, default=2.0,
-                        help="Update interval in seconds (default: 2)")
-    parser.add_argument("-n", "--count", type=int, default=0,
-                        help="Number of iterations (0 = unlimited)")
-    parser.add_argument("-1", "--once", action="store_true",
-                        help="Print one snapshot and exit")
-    parser.add_argument("--tui", action="store_true",
-                        help="Launch rich terminal UI with sparkline graphs")
-    parser.add_argument("--gui", action="store_true",
-                        help="Launch native floating window monitor")
+    parser.add_argument(
+        "--pid", type=int, nargs="+", default=None, help="Monitor specific PIDs"
+    )
+    parser.add_argument(
+        "--top", type=int, default=20, help="Show top N GPU consumers (default: 20)"
+    )
+    parser.add_argument(
+        "-i",
+        "--interval",
+        type=float,
+        default=2.0,
+        help="Update interval in seconds (default: 2)",
+    )
+    parser.add_argument(
+        "-n", "--count", type=int, default=0, help="Number of iterations (0 = unlimited)"
+    )
+    parser.add_argument("-1", "--once", action="store_true", help="Print one snapshot and exit")
+    parser.add_argument(
+        "--tui",
+        action="store_true",
+        help="Launch rich terminal UI with sparkline graphs",
+    )
+    parser.add_argument(
+        "--gui", action="store_true", help="Launch native floating window monitor"
+    )
     args = parser.parse_args()
 
-    # GUI mode — native floating window
+    # GUI mode
     if args.gui:
         from macos_gpu_proc.gui import run_gui
+
         run_gui(interval=args.interval)
         return
 
     # TUI mode
     if args.tui:
         from macos_gpu_proc.tui import run_tui
-        pids = args.pid if args.pid else None
-        run_tui(pids=pids, self_only=args.self_only, interval=args.interval, top_n=args.top)
+
+        run_tui(pids=args.pid, interval=args.interval, top_n=args.top)
         return
 
-    from macos_gpu_proc._native import gpu_time_ns, gpu_time_ns_multi
-
-    # Resolve PIDs to monitor
-    if args.self_only:
-        pids = [0]
-    elif args.pid:
-        pids = args.pid
-    else:
-        # All processes — requires sudo for task_for_pid
-        try:
-            pids = _get_all_pids()
-        except ImportError:
-            print("Install psutil for all-process monitoring: pip install macos-gpu-proc[cli]", file=sys.stderr)
-            print("Or use --self or --pid to monitor specific processes.", file=sys.stderr)
-            sys.exit(1)
+    from macos_gpu_proc._native import cpu_time_ns, proc_info
 
     if args.once:
         args.count = 1
 
-    # Handle Ctrl+C gracefully
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
 
-    # Take initial sample
-    prev = gpu_time_ns_multi(pids)
+    # Initial snapshot
+    prev = _snapshot()
+    prev_cpu: dict[int, int] = {}
+    for pid in prev:
+        ns = cpu_time_ns(pid)
+        prev_cpu[pid] = ns if ns >= 0 else 0
     prev_time = time.monotonic()
     time.sleep(args.interval)
 
@@ -117,40 +127,43 @@ def main() -> None:
     while True:
         now = time.monotonic()
         elapsed_s = now - prev_time
-
-        # Re-discover processes if monitoring all
-        if not args.self_only and not args.pid:
-            try:
-                pids = _get_all_pids()
-            except Exception:
-                pass
-
-        curr = gpu_time_ns_multi(pids)
         elapsed_ns = elapsed_s * 1_000_000_000
 
-        # Compute per-process GPU %
-        rows: list[tuple[int, str, float]] = []
-        for pid in set(list(prev.keys()) + list(curr.keys())):
-            c = curr.get(pid, -1)
-            p = prev.get(pid, -1)
-            if c < 0 or p < 0:
-                continue
-            delta = c - p
-            if delta <= 0:
-                continue
-            pct = min((delta / elapsed_ns) * 100, 100)
-            if pct < 0.1:
-                continue
-            name = "self" if pid == 0 else _pid_name(pid)
-            rows.append((pid if pid != 0 else os.getpid(), name, pct))
+        curr = _snapshot()
+        curr_cpu: dict[int, int] = {}
+        for pid in curr:
+            ns = cpu_time_ns(pid)
+            curr_cpu[pid] = ns if ns >= 0 else 0
 
-        # Sort by GPU % descending, take top N
+        # Filter to specific PIDs if requested
+        pids = set(curr.keys())
+        if args.pid:
+            pids = pids & set(args.pid)
+
+        rows: list[tuple[int, str, float, float, float, float]] = []
+        for pid in pids:
+            c_gpu = curr.get(pid, {}).get("gpu_ns", 0)
+            p_gpu = prev.get(pid, {}).get("gpu_ns", 0)
+            gpu_delta = c_gpu - p_gpu
+
+            c_cpu = curr_cpu.get(pid, 0)
+            p_cpu = prev_cpu.get(pid, 0)
+            cpu_delta = c_cpu - p_cpu
+
+            gpu_pct = min(gpu_delta / elapsed_ns * 100, 100) if elapsed_ns > 0 else 0
+            cpu_pct = cpu_delta / elapsed_ns * 100 if elapsed_ns > 0 else 0
+
+            info = proc_info(pid)
+            mem_mb = info["memory"] / (1024 * 1024) if info else 0
+            real_mb = info["real_memory"] / (1024 * 1024) if info else 0
+
+            name = curr[pid]["name"]
+            if gpu_pct >= 0.1 or gpu_delta > 0:
+                rows.append((pid, name, gpu_pct, cpu_pct, mem_mb, real_mb))
+
         rows.sort(key=lambda r: r[2], reverse=True)
-        rows = rows[:args.top]
+        rows = rows[: args.top]
 
-        total = sum(r[2] for r in rows)
-
-        # Clear screen for live mode
         if not args.once:
             print("\033[2J\033[H", end="")
 
@@ -158,13 +171,12 @@ def main() -> None:
         print(f"gpu-proc  {timestamp}  (every {args.interval}s)\n")
 
         if rows:
-            print(_format_table(rows, total if len(rows) > 1 else None))
+            print(_format_table(rows))
         else:
             print("  No GPU activity detected.")
-            if not args.self_only and os.getuid() != 0:
-                print("\n  Hint: run with sudo to see all processes.")
 
         prev = curr
+        prev_cpu = curr_cpu
         prev_time = now
 
         iteration += 1

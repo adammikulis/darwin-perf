@@ -1,8 +1,7 @@
 """gpu-proc GUI: Native floating window GPU monitor.
 
-A compact, resizable native window showing live system GPU utilization,
-per-process CPU/memory, and history charts. Designed to tuck in a corner
-while training.
+A compact, resizable native window showing live per-process GPU utilization,
+CPU, memory, and history charts. Designed to tuck in a corner while training.
 
 Uses pywebview for a native macOS window (no browser chrome).
 
@@ -17,6 +16,7 @@ import json
 import os
 import threading
 import time
+from collections import defaultdict
 
 _HTML = """<!DOCTYPE html>
 <html>
@@ -49,7 +49,6 @@ body {
 .fill-gpu { background: #8b5cf6; }
 .fill-cpu { background: #64748b; }
 .fill-mem { background: #10b981; }
-.fill-proc { background: #10b981; }
 
 canvas {
     flex: 1; min-height: 60px; width: 100%; border-radius: 4px;
@@ -63,7 +62,7 @@ canvas {
 .proc-name { font-size: 11px; color: #cbd5e1; width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .proc-pid { font-size: 10px; color: #475569; width: 50px; text-align: right; font-family: monospace; }
 .proc-bar { flex: 1; height: 4px; background: #1e293b; border-radius: 2px; overflow: hidden; }
-.proc-fill { height: 100%; background: #10b981; border-radius: 2px; transition: width 0.5s; }
+.proc-fill-gpu { height: 100%; background: #8b5cf6; border-radius: 2px; transition: width 0.5s; }
 .proc-val { font-size: 10px; color: #94a3b8; width: 50px; text-align: right; font-family: monospace; }
 </style>
 </head>
@@ -94,7 +93,7 @@ canvas {
 <div class="section-label">GPU History</div>
 <canvas id="chart"></canvas>
 
-<div class="section-label" style="margin-top:6px">Top Processes (CPU)</div>
+<div class="section-label" style="margin-top:6px">Top Processes (GPU)</div>
 <div class="proc-list" id="procs"></div>
 
 <script>
@@ -147,12 +146,11 @@ function drawChart() {
 }
 
 function update(data) {
-    // System bars
-    const gpu = data.gpu_percent ?? 0;
-    const cpu = data.cpu_percent ?? 0;
+    const gpu = data.total_gpu_pct ?? 0;
+    const cpu = data.total_cpu_pct ?? 0;
     const ramPct = data.memory_total_gb > 0 ? (data.memory_used_gb / data.memory_total_gb) * 100 : 0;
 
-    document.getElementById('gpu-bar').style.width = gpu + '%';
+    document.getElementById('gpu-bar').style.width = Math.min(gpu, 100) + '%';
     document.getElementById('gpu-val').textContent = gpu.toFixed(1) + '%';
     document.getElementById('cpu-bar').style.width = Math.min(cpu, 100) + '%';
     document.getElementById('cpu-val').textContent = cpu.toFixed(0) + '%';
@@ -160,26 +158,24 @@ function update(data) {
     document.getElementById('ram-val').textContent = data.memory_used_gb.toFixed(0) + '/' + data.memory_total_gb.toFixed(0) + 'GB';
 
     // Stats
-    const pw = data.gpu_power_w != null ? data.gpu_power_w.toFixed(0) + 'W' : '';
-    const freq = data.gpu_freq_mhz != null ? data.gpu_freq_mhz.toFixed(0) + 'MHz' : '';
-    const parts = [pw, freq].filter(Boolean).join(' / ');
-    document.getElementById('stats').innerHTML = '<b>' + parts + '</b>' + (data.gpu_name ? '  ' + data.gpu_name : '');
+    document.getElementById('stats').innerHTML = '<b>' + data.gpu_clients + ' GPU clients</b>';
 
     // History
     gpuHistory.push(gpu);
     if (gpuHistory.length > MAX_HIST) gpuHistory.shift();
     drawChart();
 
-    // Process list
+    // Process list (sorted by GPU%)
     const procs = data.processes || [];
     const el = document.getElementById('procs');
     el.innerHTML = procs.slice(0, 15).map(p =>
         '<div class="proc-row">' +
         '<span class="proc-pid">' + p.pid + '</span>' +
         '<span class="proc-name">' + p.name + '</span>' +
-        '<div class="proc-bar"><div class="proc-fill" style="width:' + Math.min(p.cpu, 100) + '%"></div></div>' +
-        '<span class="proc-val">' + p.cpu.toFixed(1) + '% cpu</span>' +
-        '<span class="proc-val">' + p.mem.toFixed(1) + 'GB</span>' +
+        '<div class="proc-bar"><div class="proc-fill-gpu" style="width:' + Math.min(p.gpu, 100) + '%"></div></div>' +
+        '<span class="proc-val">' + p.gpu.toFixed(1) + '% gpu</span>' +
+        '<span class="proc-val">' + p.cpu.toFixed(0) + '% cpu</span>' +
+        '<span class="proc-val">' + p.mem.toFixed(0) + 'MB</span>' +
         '</div>'
     ).join('');
 }
@@ -196,6 +192,9 @@ class _GpuGuiApi:
     def __init__(self, interval: float = 2.0) -> None:
         self.interval = interval
         self._window = None
+        self._prev_snap: dict[int, dict] | None = None
+        self._prev_cpu: dict[int, int] = {}
+        self._prev_time: float = 0
 
     def set_window(self, window: object) -> None:
         self._window = window
@@ -204,78 +203,91 @@ class _GpuGuiApi:
         t = threading.Thread(target=self._poll_loop, daemon=True)
         t.start()
 
+    def _snapshot(self) -> dict[int, dict]:
+        from macos_gpu_proc._native import gpu_clients
+
+        by_pid: dict[int, dict] = {}
+        for c in gpu_clients():
+            pid = c["pid"]
+            if pid not in by_pid:
+                by_pid[pid] = {"name": c["name"], "gpu_ns": 0}
+            by_pid[pid]["gpu_ns"] += c["gpu_ns"]
+        return by_pid
+
     def _collect(self) -> dict:
-        import platform
-        import re
-        import subprocess
+        from macos_gpu_proc._native import cpu_time_ns, proc_info
 
-        data: dict = {}
+        now = time.monotonic()
+        snap = self._snapshot()
 
-        # GPU via powermetrics (macOS) or nvidia-smi (Linux)
-        gpu: dict[str, float] = {}
-        if platform.system().lower() == "darwin":
-            try:
-                result = subprocess.run(
-                    ["sudo", "powermetrics", "--samplers", "gpu_power", "-i", "500", "-n", "1"],
-                    capture_output=True, text=True, timeout=3,
-                )
-                if result.returncode == 0:
-                    out = result.stdout
-                    m = re.search(r"GPU HW active residency:\s+([0-9]+(?:\.[0-9]+)?)%", out)
-                    if m: gpu["gpu_active_pct"] = float(m.group(1))
-                    m = re.search(r"GPU HW active frequency:\s+([0-9]+)\s*MHz", out)
-                    if m: gpu["gpu_freq_mhz"] = float(m.group(1))
-                    m = re.search(r"GPU Power:\s+([0-9]+)\s*mW", out)
-                    if m: gpu["gpu_power_mw"] = float(m.group(1))
-            except Exception:
-                pass
-        data["gpu_percent"] = gpu.get("gpu_active_pct")
-        data["gpu_power_w"] = gpu.get("gpu_power_mw", 0) / 1000 if gpu.get("gpu_power_mw") else None
-        data["gpu_freq_mhz"] = gpu.get("gpu_freq_mhz")
+        curr_cpu: dict[int, int] = {}
+        for pid in snap:
+            ns = cpu_time_ns(pid)
+            curr_cpu[pid] = ns if ns >= 0 else 0
 
-        # System stats via psutil
+        data: dict = {"processes": [], "gpu_clients": len(snap)}
+
+        if self._prev_snap is not None:
+            elapsed_s = now - self._prev_time
+            elapsed_ns = elapsed_s * 1_000_000_000 if elapsed_s > 0 else 1
+
+            procs = []
+            total_gpu = 0.0
+            total_cpu = 0.0
+            for pid, info in snap.items():
+                gpu_delta = info["gpu_ns"] - self._prev_snap.get(pid, {}).get("gpu_ns", info["gpu_ns"])
+                cpu_delta = curr_cpu.get(pid, 0) - self._prev_cpu.get(pid, curr_cpu.get(pid, 0))
+
+                gpu_pct = min(gpu_delta / elapsed_ns * 100, 100) if elapsed_ns > 0 else 0
+                cpu_pct = cpu_delta / elapsed_ns * 100 if elapsed_ns > 0 else 0
+
+                pinfo = proc_info(pid)
+                mem_mb = pinfo["real_memory"] / (1024 * 1024) if pinfo else 0
+
+                total_gpu += gpu_pct
+                total_cpu += cpu_pct
+
+                if gpu_pct >= 0.1 or gpu_delta > 0:
+                    procs.append({
+                        "pid": pid,
+                        "name": info["name"],
+                        "gpu": round(gpu_pct, 1),
+                        "cpu": round(cpu_pct, 1),
+                        "mem": round(mem_mb, 0),
+                    })
+
+            procs.sort(key=lambda p: p["gpu"], reverse=True)
+            data["processes"] = procs[:15]
+            data["total_gpu_pct"] = round(total_gpu, 1)
+            data["total_cpu_pct"] = round(total_cpu, 1)
+        else:
+            data["total_gpu_pct"] = 0
+            data["total_cpu_pct"] = 0
+
+        # System memory via os.sysconf or fallback
         try:
             import psutil
             mem = psutil.virtual_memory()
             data["memory_total_gb"] = round(mem.total / (1024**3), 1)
             data["memory_used_gb"] = round(mem.used / (1024**3), 1)
-            data["cpu_percent"] = psutil.cpu_percent(interval=None)
-            data["gpu_name"] = None
-
-            # Top processes by CPU
-            procs = []
-            for p in psutil.process_iter(["pid", "name", "cpu_percent", "memory_info"]):
-                try:
-                    info = p.info
-                    cpu = info.get("cpu_percent") or 0
-                    mem_info = info.get("memory_info")
-                    mem_gb = round(mem_info.rss / (1024**3), 2) if mem_info else 0
-                    if cpu > 0.1 or mem_gb > 0.1:
-                        procs.append({
-                            "pid": info["pid"],
-                            "name": info["name"] or "?",
-                            "cpu": cpu,
-                            "mem": mem_gb,
-                        })
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-            procs.sort(key=lambda p: p["cpu"], reverse=True)
-            data["processes"] = procs[:15]
         except ImportError:
-            data["memory_total_gb"] = 0
+            data["memory_total_gb"] = round(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / (1024**3), 1)
             data["memory_used_gb"] = 0
-            data["cpu_percent"] = 0
-            data["processes"] = []
 
+        self._prev_snap = snap
+        self._prev_cpu = curr_cpu
+        self._prev_time = now
         return data
 
     def _poll_loop(self) -> None:
-        # Warm up psutil cpu_percent
-        try:
-            import psutil
-            psutil.cpu_percent(interval=0.5)
-        except Exception:
-            pass
+        # Take initial baseline
+        self._prev_snap = self._snapshot()
+        from macos_gpu_proc._native import cpu_time_ns
+        for pid in self._prev_snap:
+            ns = cpu_time_ns(pid)
+            self._prev_cpu[pid] = ns if ns >= 0 else 0
+        self._prev_time = time.monotonic()
+        time.sleep(self.interval)
 
         while True:
             try:

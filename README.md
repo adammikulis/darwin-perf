@@ -1,8 +1,8 @@
 # macos-gpu-proc
 
-Per-process GPU utilization monitoring for macOS. Like Activity Monitor's GPU column, but accessible from Python and the command line.
+Per-process GPU utilization, CPU, memory, and energy monitoring for macOS Apple Silicon. **No sudo needed.**
 
-Uses the Mach `task_info(TASK_POWER_INFO_V2)` API to read cumulative GPU time per process — the same kernel data source that Activity Monitor uses. Works on Apple Silicon and AMD GPUs.
+Reads GPU client data directly from the IORegistry's AGXDeviceUserClient entries — the same data source Activity Monitor uses.
 
 ## Install
 
@@ -10,154 +10,116 @@ Uses the Mach `task_info(TASK_POWER_INFO_V2)` API to read cumulative GPU time pe
 pip install macos-gpu-proc
 ```
 
-## CLI — `gpu-proc`
+## Quick Start
 
-Live GPU process monitor, like `top` for GPU:
+```python
+from macos_gpu_proc import gpu_clients, system_gpu_stats, proc_info
+
+# List all GPU-active processes
+for c in gpu_clients():
+    print(f"PID {c['pid']} ({c['name']}): {c['gpu_ns']/1e9:.1f}s GPU time")
+
+# System-wide GPU stats (device utilization, VRAM, model name)
+stats = system_gpu_stats()
+print(f"{stats['model']} — {stats['device_utilization']}% device utilization")
+
+# Per-process detail (CPU, memory, energy, disk I/O, threads)
+info = proc_info(1234)
+print(f"CPU: {info['cpu_ns']/1e9:.1f}s, Memory: {info['memory']/1e6:.0f}MB, Energy: {info['energy_nj']/1e9:.1f}J")
+```
+
+### GPU Utilization %
+
+```python
+from macos_gpu_proc import gpu_time_ns
+import time
+
+pid = 1234
+t1 = gpu_time_ns(pid)
+time.sleep(2)
+t2 = gpu_time_ns(pid)
+gpu_pct = (t2 - t1) / (2 * 1e9) * 100
+print(f"GPU: {gpu_pct:.1f}%")
+```
+
+### GpuMonitor (continuous monitoring)
+
+```python
+from macos_gpu_proc import GpuMonitor
+
+with GpuMonitor(pid=1234) as mon:
+    mon.start(interval=2.0)
+    # ... training loop ...
+print(mon.summary())  # {'gpu_pct_avg': 42.1, 'gpu_pct_max': 87.3, ...}
+```
+
+## CLI
 
 ```bash
-# Monitor all processes (needs sudo for other processes' GPU stats)
-sudo gpu-proc
-
-# Rich terminal UI with sparkline history graphs
-sudo gpu-proc --tui
-
-# Monitor only your own process (no sudo needed)
-gpu-proc --self
-
-# Monitor specific PIDs
-gpu-proc --pid 1234 5678
-
-# Top 5 GPU consumers, update every 1s
-sudo gpu-proc --top 5 -i 1
-
-# Single snapshot
-sudo gpu-proc --once
+gpu-proc              # live per-process GPU monitor (like top for GPU)
+gpu-proc --once       # single snapshot
+gpu-proc --tui        # rich terminal UI with sparkline graphs
+gpu-proc --gui        # native floating window monitor
+gpu-proc -i 1         # 1-second update interval
+gpu-proc --pid 1234   # monitor specific PID
 ```
 
-### Plain output
-```
-gpu-proc  14:32:01  (every 2s)
+## API Reference
 
-     PID    GPU %  Process
-────────  ───────  ──────────────────────────────
-   12345   67.2%   python3.12            █████████████░░░░░░░
-   41234   12.4%   WindowServer          ██░░░░░░░░░░░░░░░░░░
-     618    3.1%   Code Helper (GPU)     ░░░░░░░░░░░░░░░░░░░░
-────────  ───────
-   Total   82.7%
-```
+### Low-level (C extension)
 
-### TUI mode (`--tui`)
+| Function | Description |
+|----------|-------------|
+| `gpu_time_ns(pid)` | Cumulative GPU nanoseconds for a PID |
+| `gpu_time_ns_multi(pids)` | Batch GPU ns for multiple PIDs |
+| `gpu_clients()` | All GPU clients: `[{'pid', 'name', 'gpu_ns'}, ...]` |
+| `cpu_time_ns(pid)` | Cumulative CPU nanoseconds (user + system) |
+| `proc_info(pid)` | Full process stats (CPU, memory, energy, disk, threads) |
+| `system_gpu_stats()` | System GPU: utilization %, VRAM, model, core count |
 
-Full-screen terminal dashboard with:
-- Per-process GPU % with live bar charts
-- Sparkline history graphs (last 120 samples per process)
-- System-wide GPU utilization with history
-- Aggregate stats: total, peak, average
-- Auto-discovers new processes, removes exited ones
-- Keyboard: `q` quit, `r` reset history
+### proc_info fields
 
-## Python API
+| Field | Description |
+|-------|-------------|
+| `cpu_ns` | Cumulative CPU time (user + system) in nanoseconds |
+| `cpu_user_ns` | User CPU time |
+| `cpu_system_ns` | System/kernel CPU time |
+| `memory` | Physical memory footprint (bytes) |
+| `real_memory` | Resident memory (bytes) |
+| `neural_footprint` | Neural Engine memory (bytes) |
+| `disk_read_bytes` | Cumulative disk reads |
+| `disk_write_bytes` | Cumulative disk writes |
+| `energy_nj` | Cumulative energy (nanojoules) — delta for watts |
+| `threads` | Current thread count |
 
-### Quick one-shot
+### system_gpu_stats fields
 
-```python
-from macos_gpu_proc import gpu_percent
+| Field | Description |
+|-------|-------------|
+| `model` | GPU model name (e.g., "Apple M4 Max") |
+| `gpu_core_count` | Number of GPU cores |
+| `device_utilization` | Device utilization % (0-100) |
+| `tiler_utilization` | Tiler utilization % |
+| `renderer_utilization` | Renderer utilization % |
+| `alloc_system_memory` | Total GPU-allocated memory |
+| `in_use_system_memory` | Currently used GPU memory |
 
-# Your own process (no sudo needed)
-pct = gpu_percent()  # blocks for 0.5s, returns GPU %
-print(f"GPU: {pct:.1f}%")
-```
+## How It Works
 
-### Continuous monitoring
+On macOS, every Metal GPU client (command queue) is registered as an `AGXDeviceUserClient` child of the AGX accelerator in the IORegistry. Each carries:
 
-```python
-from macos_gpu_proc import GpuMonitor
+- `IOUserClientCreator` — the PID and process name
+- `AppUsage` — array of `{API, accumulatedGPUTime}` entries
 
-monitor = GpuMonitor()
+This data is world-readable from the IORegistry. No `task_for_pid`, no `sudo`, no SIP changes, no private frameworks.
 
-for batch in dataloader:
-    output = model(batch)
-    loss.backward()
-    optimizer.step()
-    print(f"GPU: {monitor.sample():.1f}%")
-```
-
-### Context manager with summary
-
-```python
-from macos_gpu_proc import GpuMonitor
-
-with GpuMonitor() as mon:
-    train(model, epochs=10)
-
-stats = mon.summary()
-print(f"Avg GPU: {stats['gpu_pct_avg']:.1f}%")
-print(f"Peak GPU: {stats['gpu_pct_max']:.1f}%")
-```
-
-### Background thread
-
-```python
-monitor = GpuMonitor()
-monitor.start(interval=2.0)  # samples every 2s in background
-
-# ... do work ...
-
-monitor.stop()
-print(monitor.summary())
-```
-
-### Monitor with child processes
-
-```python
-# Sums GPU time across the process and all its children
-# (e.g., training workers spawned by your script)
-monitor = GpuMonitor(children=True)  # requires psutil
-```
-
-### Low-level: raw GPU nanoseconds
-
-```python
-from macos_gpu_proc import gpu_time_ns, gpu_time_ns_multi
-
-# Cumulative GPU time for current process
-ns = gpu_time_ns()
-
-# Batch read multiple PIDs
-results = gpu_time_ns_multi([0, 1234, 5678])
-# {0: 123456789, 1234: 987654321, 5678: -1}  # -1 = permission denied
-```
-
-## Permissions
-
-| Target | Sudo required? |
-|--------|---------------|
-| Own process (`pid=0`) | No |
-| Child processes | No (if forked from your process) |
-| Other users' processes | Yes (`sudo`) |
-
-## How it works
-
-Every macOS process has a cumulative GPU nanosecond counter maintained by the kernel (`task_power_info_v2.gpu_energy.task_gpu_utilisation`). This counter increments whenever the process submits work to the GPU (Metal, OpenCL, etc.).
-
-`macos-gpu-proc` reads this counter via the Mach `task_info()` system call, samples it over time, and computes the percentage:
-
-```
-GPU % = (gpu_ns_now - gpu_ns_prev) / elapsed_ns × 100
-```
-
-This is the same mechanism Activity Monitor uses, but exposed as a Python API.
+CPU/memory/energy stats come from `proc_pid_rusage(RUSAGE_INFO_V6)` and `proc_pidinfo(PROC_PIDTASKINFO)`.
 
 ## Requirements
 
-- macOS 12+ (Monterey or later)
+- macOS with Apple Silicon (M1/M2/M3/M4)
 - Python 3.9+
-- Apple Silicon or AMD GPU
-- `psutil` (optional, for process auto-discovery and `children=True`)
-- `textual` (optional, for `--tui` mode)
-
-Install all extras: `pip install macos-gpu-proc[all]`
+- No external dependencies for core functionality
 
 ## License
 

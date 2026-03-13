@@ -1,27 +1,24 @@
 """gpu-proc TUI: Rich terminal GPU monitor with live graphs.
 
 A full-screen terminal app showing per-process GPU utilization with
-sparkline history graphs, sorted by usage. Better than Activity Monitor
-because it shows history, works over SSH, and needs no mouse.
+sparkline history graphs, sorted by usage. No sudo needed.
 
 Usage:
-    gpu-proc --tui              # all processes (sudo for others)
-    gpu-proc --tui --self       # own process only
+    gpu-proc --tui              # all GPU-active processes
     gpu-proc --tui -i 1         # 1s update interval
 """
 
 from __future__ import annotations
 
-import os
 import time as _time
 from collections import defaultdict
 
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Vertical
 from textual.reactive import reactive
 from textual.widgets import Footer, Header, Static
 
-from ._native import gpu_time_ns_multi
+from ._native import cpu_time_ns, gpu_clients, proc_info, system_gpu_stats
 
 # ---------------------------------------------------------------------------
 # Sparkline renderer (unicode block chars)
@@ -42,13 +39,24 @@ def _sparkline(values: list[float], width: int = 40) -> str:
     )
 
 
+def _fmt_bytes(b: int) -> str:
+    """Format bytes as human-readable string."""
+    if b < 1024:
+        return f"{b}B"
+    if b < 1024**2:
+        return f"{b / 1024:.0f}K"
+    if b < 1024**3:
+        return f"{b / 1024**2:.0f}M"
+    return f"{b / 1024**3:.1f}G"
+
+
 # ---------------------------------------------------------------------------
 # Process row widget
 # ---------------------------------------------------------------------------
 
 
 class ProcessRow(Static):
-    """Single process row with name, GPU %, bar, and sparkline history."""
+    """Single process row with name, GPU %, CPU %, memory, energy, bar, sparkline."""
 
     def __init__(self, pid: int, name: str) -> None:
         super().__init__()
@@ -56,10 +64,16 @@ class ProcessRow(Static):
         self.proc_name = name
         self.history: list[float] = []
         self.current_pct: float = 0.0
+        self.cpu_pct: float = 0.0
+        self.mem_str: str = ""
+        self.power_w: float = 0.0
 
-    def update_pct(self, pct: float) -> None:
-        self.current_pct = pct
-        self.history.append(pct)
+    def update_stats(self, gpu_pct: float, cpu_pct: float, mem_str: str, power_w: float) -> None:
+        self.current_pct = gpu_pct
+        self.cpu_pct = cpu_pct
+        self.mem_str = mem_str
+        self.power_w = power_w
+        self.history.append(gpu_pct)
         if len(self.history) > 120:
             self.history = self.history[-120:]
         self.refresh_display()
@@ -68,11 +82,12 @@ class ProcessRow(Static):
         pct = self.current_pct
         bar_len = int(min(pct, 100) / 2.5)  # 40 chars = 100%
         bar = "[green]" + "━" * bar_len + "[/green]" + "[dim]" + "╌" * (40 - bar_len) + "[/dim]"
-        spark = _sparkline(self.history, 30)
-        pid_str = str(self.pid) if self.pid != 0 else str(os.getpid())
+        spark = _sparkline(self.history, 20)
+        power_str = f"{self.power_w:.1f}W" if self.power_w >= 0.01 else ""
         self.update(
-            f" {pid_str:>8}  {pct:>6.1f}%  {bar}  "
-            f"[cyan]{self.proc_name:<20}[/cyan]  "
+            f" {self.pid:>8}  {pct:>5.1f}%  {self.cpu_pct:>5.1f}%  "
+            f"{self.mem_str:>6}  {power_str:>5}  {bar}  "
+            f"[cyan]{self.proc_name:<18}[/cyan]  "
             f"[dim]{spark}[/dim]"
         )
 
@@ -88,14 +103,17 @@ class SummaryBar(Static):
     total_gpu = reactive(0.0)
     process_count = reactive(0)
     peak_gpu = reactive(0.0)
-    avg_gpu = reactive(0.0)
+    model_name = reactive("")
+    core_count = reactive(0)
+    device_util = reactive(0)
 
     def render(self) -> str:
         return (
-            f"  [bold]GPU Total:[/bold] [green]{self.total_gpu:5.1f}%[/green]"
+            f"  [bold]{self.model_name}[/bold] ({self.core_count} cores)"
+            f"  │  [bold]GPU:[/bold] [green]{self.device_util}%[/green] (hw)"
+            f"  │  [bold]Sum:[/bold] [green]{self.total_gpu:5.1f}%[/green]"
             f"  │  [bold]Peak:[/bold] [yellow]{self.peak_gpu:5.1f}%[/yellow]"
-            f"  │  [bold]Avg:[/bold] {self.avg_gpu:5.1f}%"
-            f"  │  [bold]Processes:[/bold] {self.process_count}"
+            f"  │  [bold]Clients:[/bold] {self.process_count}"
         )
 
 
@@ -111,15 +129,16 @@ class SystemGpuBar(Static):
         super().__init__(**kwargs)
         self.history: list[float] = []
 
-    def update_value(self, total_pct: float) -> None:
-        self.history.append(total_pct)
+    def update_value(self, device_pct: float, alloc_mem: int, used_mem: int) -> None:
+        self.history.append(device_pct)
         if len(self.history) > 120:
             self.history = self.history[-120:]
         spark = _sparkline(self.history, 60)
-        bar_len = int(min(total_pct, 100) / 1.67)  # 60 chars = 100%
+        bar_len = int(min(device_pct, 100) / 1.67)  # 60 chars = 100%
         bar = "[green]" + "█" * bar_len + "[/green]" + "[dim]" + "░" * (60 - bar_len) + "[/dim]"
         self.update(
-            f"  [bold]System GPU[/bold]  {total_pct:5.1f}%  {bar}\n"
+            f"  [bold]Device GPU[/bold]  {device_pct:5.1f}%  {bar}"
+            f"  VRAM: {_fmt_bytes(used_mem)}/{_fmt_bytes(alloc_mem)}\n"
             f"  [dim]History:[/dim]  {spark}"
         )
 
@@ -169,16 +188,16 @@ class GpuProcApp(App):
     def __init__(
         self,
         pids: list[int] | None = None,
-        self_only: bool = False,
         interval: float = 2.0,
         top_n: int = 30,
     ) -> None:
         super().__init__()
         self._target_pids = pids
-        self._self_only = self_only
         self._interval = interval
         self._top_n = top_n
-        self._prev: dict[int, int] = {}
+        self._prev_snap: dict[int, dict] = {}
+        self._prev_cpu: dict[int, int] = {}
+        self._prev_energy: dict[int, int] = {}
         self._prev_time: float = 0
         self._rows: dict[int, ProcessRow] = {}
         self._all_totals: list[float] = []
@@ -188,107 +207,120 @@ class GpuProcApp(App):
         yield SummaryBar(id="summary")
         yield SystemGpuBar(id="system-bar")
         yield Static(
-            "      PID   GPU %   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  "
-            "Process               History",
+            "      PID  GPU %  CPU %    Mem  Power  "
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  "
+            "Process             History",
             id="header-row",
         )
         yield Vertical(id="process-list")
         yield Footer()
 
+    def _snapshot(self) -> dict[int, dict]:
+        by_pid: dict[int, dict] = {}
+        for c in gpu_clients():
+            pid = c["pid"]
+            if pid not in by_pid:
+                by_pid[pid] = {"name": c["name"], "gpu_ns": 0}
+            by_pid[pid]["gpu_ns"] += c["gpu_ns"]
+        return by_pid
+
     def on_mount(self) -> None:
-        # Take baseline sample
-        pids = self._resolve_pids()
-        self._prev = gpu_time_ns_multi(pids)
+        snap = self._snapshot()
+        self._prev_snap = snap
+        for pid in snap:
+            ns = cpu_time_ns(pid)
+            self._prev_cpu[pid] = ns if ns >= 0 else 0
+            info = proc_info(pid)
+            self._prev_energy[pid] = info["energy_nj"] if info else 0
         self._prev_time = _time.monotonic()
-        # Start periodic refresh
         self.set_interval(self._interval, self._refresh)
-
-    def _resolve_pids(self) -> list[int]:
-        if self._self_only:
-            return [0]
-        if self._target_pids:
-            return list(self._target_pids)
-        try:
-            import psutil
-            return [p.pid for p in psutil.process_iter(["pid"])]
-        except ImportError:
-            return [0]
-
-    def _pid_name(self, pid: int) -> str:
-        if pid == 0:
-            return "self"
-        try:
-            import psutil
-            return psutil.Process(pid).name()
-        except Exception:
-            return "?"
 
     def _refresh(self) -> None:
         now = _time.monotonic()
         elapsed_s = now - self._prev_time
         if elapsed_s <= 0:
             return
-
-        pids = self._resolve_pids()
-        curr = gpu_time_ns_multi(pids)
         elapsed_ns = elapsed_s * 1_000_000_000
 
-        # Compute per-process GPU %
-        active: list[tuple[int, str, float]] = []
-        for pid in set(list(self._prev.keys()) + list(curr.keys())):
-            c = curr.get(pid, -1)
-            p = self._prev.get(pid, -1)
-            if c < 0 or p < 0:
-                continue
-            delta = c - p
-            if delta < 0:
-                continue
-            pct = min((delta / elapsed_ns) * 100, 100)
-            if pct < 0.05:
-                continue
-            name = self._pid_name(pid)
-            active.append((pid, name, pct))
+        snap = self._snapshot()
+        curr_cpu: dict[int, int] = {}
+        curr_energy: dict[int, int] = {}
+        for pid in snap:
+            ns = cpu_time_ns(pid)
+            curr_cpu[pid] = ns if ns >= 0 else 0
+            info = proc_info(pid)
+            curr_energy[pid] = info["energy_nj"] if info else 0
 
-        self._prev = curr
+        # Filter to specific PIDs if requested
+        pids = set(snap.keys())
+        if self._target_pids:
+            pids = pids & set(self._target_pids)
+
+        active: list[tuple[int, str, float, float, str, float]] = []
+        for pid in pids:
+            c_gpu = snap.get(pid, {}).get("gpu_ns", 0)
+            p_gpu = self._prev_snap.get(pid, {}).get("gpu_ns", c_gpu)
+            gpu_delta = c_gpu - p_gpu
+
+            cpu_delta = curr_cpu.get(pid, 0) - self._prev_cpu.get(pid, curr_cpu.get(pid, 0))
+            energy_delta = curr_energy.get(pid, 0) - self._prev_energy.get(pid, curr_energy.get(pid, 0))
+
+            gpu_pct = min(gpu_delta / elapsed_ns * 100, 100) if elapsed_ns > 0 else 0
+            cpu_pct = cpu_delta / elapsed_ns * 100 if elapsed_ns > 0 else 0
+            power_w = energy_delta / (elapsed_s * 1e9) if elapsed_s > 0 else 0
+
+            info = proc_info(pid)
+            mem_str = _fmt_bytes(info["memory"]) if info else "0"
+
+            name = snap[pid]["name"]
+            if gpu_pct >= 0.05 or gpu_delta > 0:
+                active.append((pid, name, gpu_pct, cpu_pct, mem_str, power_w))
+
+        self._prev_snap = snap
+        self._prev_cpu = curr_cpu
+        self._prev_energy = curr_energy
         self._prev_time = now
 
-        # Sort by GPU %, take top N
         active.sort(key=lambda r: r[2], reverse=True)
         active = active[:self._top_n]
 
         total_pct = sum(r[2] for r in active)
         self._all_totals.append(total_pct)
 
-        # Update summary
+        # System-wide GPU stats
+        sys_stats = system_gpu_stats()
+
         summary = self.query_one("#summary", SummaryBar)
         summary.total_gpu = total_pct
         summary.process_count = len(active)
         summary.peak_gpu = max(self._all_totals) if self._all_totals else 0
-        summary.avg_gpu = sum(self._all_totals) / len(self._all_totals) if self._all_totals else 0
+        summary.model_name = sys_stats.get("model", "?")
+        summary.core_count = sys_stats.get("gpu_core_count", 0)
+        summary.device_util = sys_stats.get("device_utilization", 0)
 
-        # Update system bar
         sys_bar = self.query_one("#system-bar", SystemGpuBar)
-        sys_bar.update_value(total_pct)
+        sys_bar.update_value(
+            sys_stats.get("device_utilization", 0),
+            sys_stats.get("alloc_system_memory", 0),
+            sys_stats.get("in_use_system_memory", 0),
+        )
 
-        # Update/add/remove process rows
         container = self.query_one("#process-list")
         active_pids = {r[0] for r in active}
 
-        # Remove rows for processes no longer active
         for pid in list(self._rows.keys()):
             if pid not in active_pids:
                 self._rows[pid].remove()
                 del self._rows[pid]
 
-        # Update or create rows
-        for pid, name, pct in active:
+        for pid, name, gpu_pct, cpu_pct, mem_str, power_w in active:
             if pid in self._rows:
-                self._rows[pid].update_pct(pct)
+                self._rows[pid].update_stats(gpu_pct, cpu_pct, mem_str, power_w)
             else:
                 row = ProcessRow(pid, name)
                 self._rows[pid] = row
                 container.mount(row)
-                row.update_pct(pct)
+                row.update_stats(gpu_pct, cpu_pct, mem_str, power_w)
 
     def action_reset(self) -> None:
         """Reset all history."""
@@ -301,10 +333,9 @@ class GpuProcApp(App):
 
 def run_tui(
     pids: list[int] | None = None,
-    self_only: bool = False,
     interval: float = 2.0,
     top_n: int = 30,
 ) -> None:
     """Launch the TUI app."""
-    app = GpuProcApp(pids=pids, self_only=self_only, interval=interval, top_n=top_n)
+    app = GpuProcApp(pids=pids, interval=interval, top_n=top_n)
     app.run()

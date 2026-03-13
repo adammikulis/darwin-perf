@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "macos-gpu-proc"
 version = "0.1.0"
-description = "Per-process GPU utilization monitoring for macOS — like Activity Monitor, from Python."
+description = "Per-process GPU utilization, CPU, memory, and energy monitoring for macOS Apple Silicon — no sudo needed."
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
@@ -25,9 +25,8 @@ keywords = ["macos", "gpu", "monitoring", "apple-silicon", "metal", "mlx", "pyto
 
 [project.optional-dependencies]
 children = ["psutil"]
-cli = ["psutil"]
-tui = ["textual>=0.40", "psutil"]
-gui = ["pywebview>=5.0", "psutil"]
+tui = ["textual>=0.40"]
+gui = ["pywebview>=5.0"]
 all = ["psutil", "textual>=0.40", "pywebview>=5.0"]
 
 [project.scripts]

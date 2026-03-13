@@ -1,8 +1,8 @@
-"""Per-process GPU utilization monitoring for macOS.
+"""Per-process GPU utilization monitoring for macOS Apple Silicon.
 
-Uses the Mach task_info API to read GPU time counters — the same data
-source that Activity Monitor uses. Works on any Mac with Apple Silicon
-or AMD GPU.
+Reads per-client GPU accounting from the IORegistry's AGXDeviceUserClient
+entries — the same data source Activity Monitor uses. No sudo or
+entitlements required.
 
 Quick start::
 
@@ -19,15 +19,16 @@ Or as a context manager with automatic summary::
         pass
     print(mon.summary())  # {'gpu_pct_avg': 42.1, 'gpu_pct_peak': 87.3, ...}
 
-For other processes (requires sudo or entitlement)::
+Monitor any process (no privileges needed)::
 
     monitor = GpuMonitor(pid=12345)
     print(monitor.sample())
 
-Low-level access::
+List all GPU clients::
 
-    from macos_gpu_proc import gpu_time_ns
-    ns = gpu_time_ns()  # cumulative GPU nanoseconds for current process
+    from macos_gpu_proc import gpu_clients
+    for c in gpu_clients():
+        print(f"PID {c['pid']} ({c['name']}): {c['gpu_ns']/1e9:.1f}s")
 """
 
 from __future__ import annotations
@@ -37,14 +38,25 @@ import threading
 import time as _time
 from typing import Any
 
-from ._native import gpu_time_ns, gpu_time_ns_multi
+from ._native import (
+    cpu_time_ns,
+    gpu_clients,
+    gpu_time_ns,
+    gpu_time_ns_multi,
+    proc_info,
+    system_gpu_stats,
+)
 
 __all__ = [
     "GpuMonitor",
+    "cpu_time_ns",
+    "gpu_clients",
     "gpu_time_ns",
     "gpu_time_ns_multi",
     "gpu_percent",
+    "proc_info",
     "sample_gpu",
+    "system_gpu_stats",
 ]
 
 __version__ = "0.1.0"
