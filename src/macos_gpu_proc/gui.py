@@ -264,14 +264,26 @@ class _GpuGuiApi:
             data["total_gpu_pct"] = 0
             data["total_cpu_pct"] = 0
 
-        # System memory via os.sysconf or fallback
+        # System memory via sysctl + vm_stat (no psutil needed)
+        import subprocess
         try:
-            import psutil
-            mem = psutil.virtual_memory()
-            data["memory_total_gb"] = round(mem.total / (1024**3), 1)
-            data["memory_used_gb"] = round(mem.used / (1024**3), 1)
-        except ImportError:
-            data["memory_total_gb"] = round(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / (1024**3), 1)
+            hw_mem = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip())
+            data["memory_total_gb"] = round(hw_mem / (1024**3), 1)
+            # Parse vm_stat for used memory
+            vm = subprocess.check_output(["vm_stat"], text=True)
+            pages: dict[str, int] = {}
+            for line in vm.splitlines():
+                if ":" in line:
+                    k, _, v = line.partition(":")
+                    v = v.strip().rstrip(".")
+                    if v.isdigit():
+                        pages[k.strip()] = int(v)
+            page_size = 16384  # Apple Silicon default
+            used = (pages.get("Pages active", 0) + pages.get("Pages wired down", 0)
+                    + pages.get("Pages occupied by compressor", 0)) * page_size
+            data["memory_used_gb"] = round(used / (1024**3), 1)
+        except Exception:
+            data["memory_total_gb"] = 0
             data["memory_used_gb"] = 0
 
         self._prev_snap = snap

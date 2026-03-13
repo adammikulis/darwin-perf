@@ -124,8 +124,8 @@ class GpuMonitor:
 
     Args:
         pid: Process ID to monitor. 0 (default) = current process.
-        children: If True, also monitor child processes and sum their
-            GPU time (requires psutil for child PID discovery).
+        children: If True, also monitor child processes by scanning
+            GPU clients for matching parent PIDs.
 
     Example::
 
@@ -153,14 +153,13 @@ class GpuMonitor:
 
     def _collect_pids(self) -> list[int]:
         """Return list of PIDs to sample (self + children if enabled)."""
-        pids = [self.pid]
+        pid = self.pid if self.pid != 0 else os.getpid()
+        pids = [pid]
         if self.children:
-            try:
-                import psutil
-                proc = psutil.Process(self.pid or os.getpid())
-                pids.extend(c.pid for c in proc.children(recursive=True))
-            except Exception:
-                pass
+            # Scan GPU clients — any child processes using GPU will appear
+            for c in gpu_clients():
+                if c["pid"] != pid and c["pid"] not in pids:
+                    pids.append(c["pid"])
         return pids
 
     def _read_total_ns(self) -> int:

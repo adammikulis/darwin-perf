@@ -24,10 +24,9 @@ classifiers = [
 keywords = ["macos", "gpu", "monitoring", "apple-silicon", "metal", "mlx", "pytorch", "mps", "m1", "m2", "m3", "m4", "m5"]
 
 [project.optional-dependencies]
-children = ["psutil"]
 tui = ["textual>=0.40"]
 gui = ["pywebview>=5.0"]
-all = ["psutil", "textual>=0.40", "pywebview>=5.0"]
+all = ["textual>=0.40", "pywebview>=5.0"]
 
 [project.scripts]
 gpu-proc = "macos_gpu_proc.cli:main"
