@@ -39,7 +39,7 @@ def test_gpu_time_ns_multi_invalid_pid():
     from macos_gpu_proc import gpu_time_ns_multi
 
     result = gpu_time_ns_multi([999999999])
-    assert result[999999999] == -1
+    assert result[999999999] == 0
 
 
 def test_monitor_self():

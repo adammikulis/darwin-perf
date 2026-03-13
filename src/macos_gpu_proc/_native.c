@@ -538,6 +538,29 @@ static PyObject* py_system_gpu_stats(PyObject* self, PyObject* args) {
 
 
 /* ------------------------------------------------------------------ */
+/* Parent PID lookup via proc_pidinfo                                  */
+/* ------------------------------------------------------------------ */
+
+PyDoc_STRVAR(ppid_doc,
+"ppid(pid) -> int\n\n"
+"Return the parent process ID for the given PID.\n\n"
+"Uses proc_pidinfo(PROC_PIDTBSDINFO). Returns -1 on error.");
+
+static PyObject* py_ppid(PyObject* self, PyObject* args) {
+    int pid;
+    if (!PyArg_ParseTuple(args, "i", &pid))
+        return NULL;
+
+    struct proc_bsdinfo bsdinfo;
+    int ret = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsdinfo, sizeof(bsdinfo));
+    if (ret <= 0)
+        return PyLong_FromLong(-1);
+
+    return PyLong_FromLong(bsdinfo.pbi_ppid);
+}
+
+
+/* ------------------------------------------------------------------ */
 /* Module definition                                                   */
 /* ------------------------------------------------------------------ */
 
@@ -548,6 +571,7 @@ static PyMethodDef methods[] = {
     {"cpu_time_ns",       py_cpu_time_ns,       METH_VARARGS, cpu_time_ns_doc},
     {"proc_info",         py_proc_info,         METH_VARARGS, proc_info_doc},
     {"system_gpu_stats",  py_system_gpu_stats,  METH_NOARGS,  system_gpu_stats_doc},
+    {"ppid",              py_ppid,              METH_VARARGS, ppid_doc},
     {NULL, NULL, 0, NULL}
 };
 
