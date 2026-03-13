@@ -29,6 +29,21 @@ for proc in snapshot():
 
 Each dict in the list contains: `pid`, `name`, `gpu_percent`, `cpu_percent`, `memory_mb`, `energy_w`, `threads`, and `gpu_ns`.
 
+### GPU Power & Frequency
+
+```python
+from macos_gpu_proc import gpu_power
+
+power = gpu_power(interval=1.0)  # samples over 1 second
+print(f"GPU Power: {power['gpu_power_w']:.2f}W")
+print(f"Throttled: {power['throttled']}")
+print(f"Active state: {power['active_state']}")
+for state in power['frequency_states']:
+    print(f"  {state['state']}: {state['residency_pct']:.1f}%")
+```
+
+Uses `libIOReport.dylib` (the same data source as `powermetrics`). No sudo needed.
+
 ### System-Wide GPU
 
 ```python
@@ -104,6 +119,7 @@ python -m macos_gpu_proc  # alternative entry point (same as gpu-proc)
 | `cpu_time_ns(pid)` | Cumulative CPU nanoseconds (user + system) |
 | `proc_info(pid)` | Full process stats (CPU, memory, energy, disk, threads) |
 | `system_gpu_stats()` | System GPU: utilization %, VRAM, model, core count |
+| `gpu_power(interval)` | GPU power (watts), frequency states, thermal throttling via IOReport |
 | `ppid(pid)` | Parent process ID for a PID (-1 on error) |
 
 ### proc_info fields

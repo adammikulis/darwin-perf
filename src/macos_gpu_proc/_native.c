@@ -597,6 +597,529 @@ static PyObject* py_ppid(PyObject* self, PyObject* args) {
 
 
 /* ------------------------------------------------------------------ */
+/* GPU power/frequency/temperature via libIOReport                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * libIOReport is an undocumented Apple library that provides access to
+ * IOReport channels — the same data source powermetrics uses. No sudo
+ * needed. We dlopen it at runtime to avoid hard linking.
+ *
+ * Key functions:
+ *   IOReportCopyChannelsInGroup(group, subgroup) -> CFDictionary
+ *   IOReportCreateSubscription(NULL, channels, &subbed, 0, NULL) -> sub
+ *   IOReportCreateSamples(sub, subbed, NULL) -> sample
+ *   IOReportCreateSamplesDelta(s1, s2, NULL) -> delta
+ *   IOReportSimpleGetIntegerValue(entry, NULL) -> int64
+ *   IOReportStateGetCount/Residency/NameForIndex -> state data
+ *   IOReportChannelGetChannelName/SubGroup/Format -> channel metadata
+ */
+
+#include <dlfcn.h>
+
+/* IOReport format types */
+#define kIOReportFormatSimple    1
+#define kIOReportFormatState     2
+#define kIOReportFormatHistogram 3
+
+/* Function pointer typedefs */
+typedef CFDictionaryRef (*IOReportCopyChannelsInGroup_t)(CFStringRef, CFStringRef);
+typedef void (*IOReportMergeChannels_t)(CFMutableDictionaryRef, CFDictionaryRef, CFTypeRef);
+typedef int (*IOReportGetChannelCount_t)(CFDictionaryRef);
+typedef CFTypeRef (*IOReportCreateSubscription_t)(void*, CFMutableDictionaryRef, CFMutableDictionaryRef*, uint64_t, CFTypeRef);
+typedef CFDictionaryRef (*IOReportCreateSamples_t)(CFTypeRef, CFMutableDictionaryRef, CFTypeRef);
+typedef CFDictionaryRef (*IOReportCreateSamplesDelta_t)(CFDictionaryRef, CFDictionaryRef, CFTypeRef);
+typedef int64_t (*IOReportSimpleGetIntegerValue_t)(CFDictionaryRef, void*);
+typedef CFStringRef (*IOReportChannelGetChannelName_t)(CFDictionaryRef);
+typedef CFStringRef (*IOReportChannelGetSubGroup_t)(CFDictionaryRef);
+typedef int32_t (*IOReportChannelGetFormat_t)(CFDictionaryRef);
+typedef int32_t (*IOReportStateGetCount_t)(CFDictionaryRef);
+typedef int64_t (*IOReportStateGetResidency_t)(CFDictionaryRef, int32_t);
+typedef CFStringRef (*IOReportStateGetNameForIndex_t)(CFDictionaryRef, int32_t);
+
+/* Cached function pointers */
+static int ior_loaded = 0;
+static IOReportCopyChannelsInGroup_t     ior_CopyChannelsInGroup;
+static IOReportMergeChannels_t           ior_MergeChannels;
+static IOReportGetChannelCount_t         ior_GetChannelCount;
+static IOReportCreateSubscription_t      ior_CreateSubscription;
+static IOReportCreateSamples_t           ior_CreateSamples;
+static IOReportCreateSamplesDelta_t      ior_CreateSamplesDelta;
+static IOReportSimpleGetIntegerValue_t   ior_SimpleGetIntegerValue;
+static IOReportChannelGetChannelName_t   ior_ChannelGetChannelName;
+static IOReportChannelGetSubGroup_t      ior_ChannelGetSubGroup;
+static IOReportChannelGetFormat_t        ior_ChannelGetFormat;
+static IOReportStateGetCount_t           ior_StateGetCount;
+static IOReportStateGetResidency_t       ior_StateGetResidency;
+static IOReportStateGetNameForIndex_t    ior_StateGetNameForIndex;
+
+static int load_ioreport(void) {
+    if (ior_loaded) return ior_loaded > 0 ? 0 : -1;
+
+    void *lib = dlopen("/usr/lib/libIOReport.dylib", RTLD_LAZY);
+    if (!lib) {
+        /* Try without path — dyld shared cache */
+        lib = dlopen("libIOReport.dylib", RTLD_LAZY);
+    }
+    if (!lib) { ior_loaded = -1; return -1; }
+
+    #define LOAD(name) ior_##name = (IOReport##name##_t)dlsym(lib, "IOReport" #name); \
+        if (!ior_##name) { ior_loaded = -1; return -1; }
+
+    LOAD(CopyChannelsInGroup)
+    LOAD(MergeChannels)
+    LOAD(GetChannelCount)
+    LOAD(CreateSubscription)
+    LOAD(CreateSamples)
+    LOAD(CreateSamplesDelta)
+    LOAD(SimpleGetIntegerValue)
+    LOAD(ChannelGetChannelName)
+    LOAD(ChannelGetSubGroup)
+    LOAD(ChannelGetFormat)
+    LOAD(StateGetCount)
+    LOAD(StateGetResidency)
+    LOAD(StateGetNameForIndex)
+
+    #undef LOAD
+    ior_loaded = 1;
+    return 0;
+}
+
+/**
+ * Helper: compare CFString to C string via extraction.
+ * Uses CFStringGetCString + strcmp rather than CFStringCompare,
+ * which avoids issues with tagged/constant string representations.
+ */
+static int cfstr_eq(CFStringRef cf, const char *c) {
+    if (!cf) return 0;
+    char buf[256];
+    if (!CFStringGetCString(cf, buf, sizeof(buf), kCFStringEncodingUTF8))
+        return 0;
+    return strcmp(buf, c) == 0;
+}
+
+/**
+ * Helper: convert CFString to a Python string (or None).
+ */
+static PyObject* cfstr_to_pystr(CFStringRef cf) {
+    if (!cf) Py_RETURN_NONE;
+    char buf[256];
+    if (CFStringGetCString(cf, buf, sizeof(buf), kCFStringEncodingUTF8))
+        return PyUnicode_FromString(buf);
+    Py_RETURN_NONE;
+}
+
+
+PyDoc_STRVAR(gpu_power_doc,
+"gpu_power(interval=1.0) -> dict\n\n"
+"Sample GPU power, temperature, and frequency state via IOReport.\n\n"
+"Takes two IOReport samples separated by ``interval`` seconds and\n"
+"returns the delta. No sudo or special privileges needed.\n\n"
+"Args:\n"
+"    interval: Sampling interval in seconds (default 1.0).\n\n"
+"Returns dict with keys:\n"
+"    - 'gpu_power_w': float — GPU power draw in watts\n"
+"    - 'gpu_energy_nj': int — GPU energy delta in nanojoules\n"
+"    - 'temperatures': dict — GPU die sensor temperatures (°C)\n"
+"        e.g. {'avg': 42.1, 'sensors': {'Tg1a': 41, 'Tg5a': 43, ...}}\n"
+"    - 'frequency_states': list — P-state residency during interval\n"
+"        e.g. [{'state': 'P1', 'residency_pct': 20.5}, ...]\n"
+"    - 'active_state': str — current GPU power state ('PERF' or 'IDLE_OFF')\n"
+"    - 'throttled': bool — whether GPU is thermally throttled\n"
+"    - 'power_limit_pct': int — PPM target as %% of max GPU power\n\n"
+"Returns empty dict if libIOReport is unavailable.");
+
+static PyObject* py_gpu_power(PyObject* self, PyObject* args) {
+    double interval = 1.0;
+    if (!PyArg_ParseTuple(args, "|d", &interval))
+        return NULL;
+
+    if (load_ioreport() < 0)
+        return PyDict_New();
+
+    /* Get channels for Energy Model + GPU Stats */
+    CFStringRef energy_group = CFStringCreateWithCString(kCFAllocatorDefault,
+        "Energy Model", kCFStringEncodingUTF8);
+    CFStringRef gpu_group = CFStringCreateWithCString(kCFAllocatorDefault,
+        "GPU Stats", kCFStringEncodingUTF8);
+
+    CFMutableDictionaryRef channels = (CFMutableDictionaryRef)
+        ior_CopyChannelsInGroup(energy_group, NULL);
+    CFDictionaryRef gpu_channels = ior_CopyChannelsInGroup(gpu_group, NULL);
+
+    if (!channels || !gpu_channels) {
+        if (channels) CFRelease(channels);
+        if (gpu_channels) CFRelease(gpu_channels);
+        CFRelease(energy_group);
+        CFRelease(gpu_group);
+        return PyDict_New();
+    }
+
+    ior_MergeChannels(channels, gpu_channels, NULL);
+    CFRelease(gpu_channels);
+
+    /* Subscribe and take two samples */
+    CFMutableDictionaryRef subbed = NULL;
+    CFTypeRef sub = ior_CreateSubscription(NULL, channels, &subbed, 0, NULL);
+    if (!sub || !subbed) {
+        if (channels) CFRelease(channels);
+        CFRelease(energy_group);
+        CFRelease(gpu_group);
+        return PyDict_New();
+    }
+
+    CFDictionaryRef s1 = ior_CreateSamples(sub, subbed, NULL);
+
+    /* Release GIL during sleep */
+    Py_BEGIN_ALLOW_THREADS
+    usleep((useconds_t)(interval * 1e6));
+    Py_END_ALLOW_THREADS
+
+    CFDictionaryRef s2 = ior_CreateSamples(sub, subbed, NULL);
+
+    if (!s1 || !s2) {
+        if (s1) CFRelease(s1);
+        if (s2) CFRelease(s2);
+        CFRelease(channels);
+        CFRelease(energy_group);
+        CFRelease(gpu_group);
+        return PyDict_New();
+    }
+
+    /* Keep both samples for manual delta computation */
+    CFDictionaryRef s1_keep = s1;
+    /* s1_keep and s2 both retained */
+
+    /* Build result dict */
+    PyObject *result = PyDict_New();
+    if (!result) {
+        CFRelease(s1_keep);
+        CFRelease(s2);
+        CFRelease(channels);
+        CFRelease(energy_group);
+        CFRelease(gpu_group);
+        return NULL;
+    }
+
+    /* Parse delta channels */
+    /* Note: must use the dict's own key for lookup. Extract via GetKeysAndValues
+     * since CFSTR() constant strings may not match IOReport's internal keys. */
+    CFArrayRef delta_arr = NULL;
+    CFArrayRef abs_arr = NULL;
+    /**
+     * Extract channels from IOReport sample. The dict has one key
+     * ("IOReportChannels" or "IOReportDrivers"). We use CFEqual for
+     * key comparison since CFSTR() constants and IOReport's internal
+     * keys may use different string representations.
+     */
+    /* Use IOReportIterate to collect all channels from delta/sample.
+     * This avoids the CFDictionary key matching issue entirely. */
+    /* Actually, we need to use IOReportCreateSamplesProcessed or
+     * just pass subbed (which has IOReportChannels) through
+     * IOReportCreateSamplesDelta differently.
+     *
+     * Alternative approach: don't use delta at all. Take two raw samples
+     * and compute deltas ourselves in C, same as we do for GPU time. */
+
+    /* Approach: use s1 and s2 directly (both have IOReportChannels
+     * since they come from IOReportCreateSamples, not delta). */
+    /**
+     * IOReport sample structure (empirically determined):
+     *   {"IOReportDrivers": {
+     *       "DriverName <id>": {
+     *           "IOReportChannels": [channel, ...]
+     *       }, ...
+     *   }}
+     *
+     * We need to find all IOReportChannels arrays across all drivers
+     * and concatenate them. For simplicity, we collect them into a
+     * flat C array of channel refs.
+     */
+    #define MAX_CHANNELS 1024
+
+    typedef struct {
+        CFDictionaryRef ch;  /* channel dict from s2 */
+        CFDictionaryRef ch1; /* matching channel from s1 (same index) */
+    } channel_pair_t;
+
+    channel_pair_t *pairs = malloc(MAX_CHANNELS * sizeof(channel_pair_t));
+    int n_pairs = 0;
+
+    /* Extract channels from the nested IOReportDrivers structure */
+    {
+        /* Get IOReportDrivers dict (first value in the sample dict) */
+        CFIndex sn = CFDictionaryGetCount(s1_keep);
+        CFIndex sn2 = CFDictionaryGetCount(s2);
+        if (sn > 0 && sn2 > 0) {
+            const void *sk1[4], *sv1[4], *sk2[4], *sv2[4];
+            CFDictionaryGetKeysAndValues(s1_keep, sk1, sv1);
+            CFDictionaryGetKeysAndValues(s2, sk2, sv2);
+
+            /* First value should be the IOReportDrivers dict */
+            CFDictionaryRef drivers1 = (CFGetTypeID(sv1[0]) == CFDictionaryGetTypeID())
+                ? (CFDictionaryRef)sv1[0] : NULL;
+            CFDictionaryRef drivers2 = (CFGetTypeID(sv2[0]) == CFDictionaryGetTypeID())
+                ? (CFDictionaryRef)sv2[0] : NULL;
+
+            if (drivers1 && drivers2) {
+                /* Iterate driver dicts in drivers2 */
+                CFIndex nd = CFDictionaryGetCount(drivers2);
+                const void **dk = malloc(nd * sizeof(void*));
+                const void **dv = malloc(nd * sizeof(void*));
+                CFDictionaryGetKeysAndValues(drivers2, dk, dv);
+
+                for (CFIndex d = 0; d < nd; d++) {
+                    if (CFGetTypeID(dv[d]) != CFDictionaryGetTypeID()) continue;
+                    CFDictionaryRef drv2 = (CFDictionaryRef)dv[d];
+                    /* Get matching driver from s1 */
+                    CFDictionaryRef drv1 = (CFDictionaryRef)CFDictionaryGetValue(drivers1, dk[d]);
+
+                    /* Find IOReportChannels array in this driver */
+                    CFIndex dnk = CFDictionaryGetCount(drv2);
+                    const void **ddk = malloc(dnk * sizeof(void*));
+                    const void **ddv = malloc(dnk * sizeof(void*));
+                    CFDictionaryGetKeysAndValues(drv2, ddk, ddv);
+
+                    CFArrayRef ch_arr2 = NULL, ch_arr1 = NULL;
+                    for (CFIndex k = 0; k < dnk; k++) {
+                        if (CFGetTypeID(ddv[k]) == CFArrayGetTypeID()) {
+                            ch_arr2 = (CFArrayRef)ddv[k];
+                            /* Find matching array in drv1 */
+                            if (drv1 && CFGetTypeID(drv1) == CFDictionaryGetTypeID()) {
+                                CFTypeRef v1 = CFDictionaryGetValue(drv1, ddk[k]);
+                                if (v1 && CFGetTypeID(v1) == CFArrayGetTypeID())
+                                    ch_arr1 = (CFArrayRef)v1;
+                            }
+                            break;
+                        }
+                    }
+                    free(ddk);
+                    free(ddv);
+
+                    if (ch_arr2 && ch_arr1) {
+                        CFIndex nc = CFArrayGetCount(ch_arr2);
+                        CFIndex nc1 = CFArrayGetCount(ch_arr1);
+                        if (nc1 < nc) nc = nc1;
+                        for (CFIndex c = 0; c < nc && n_pairs < MAX_CHANNELS; c++) {
+                            pairs[n_pairs].ch = CFArrayGetValueAtIndex(ch_arr2, c);
+                            pairs[n_pairs].ch1 = CFArrayGetValueAtIndex(ch_arr1, c);
+                            n_pairs++;
+                        }
+                    }
+                }
+                free(dk);
+                free(dv);
+            }
+        }
+    }
+
+    /* Also collect abs_arr for temperatures from s2 pairs */
+
+    /* Temps dict and sensors sub-dict */
+    PyObject *temps_dict = PyDict_New();
+    PyObject *sensors_dict = PyDict_New();
+    long long temp_sum = 0;
+    int temp_count = 0;
+
+    /* Frequency states list */
+    PyObject *freq_list = PyList_New(0);
+
+    if (n_pairs > 0) {
+        for (int i = 0; i < n_pairs; i++) {
+            CFDictionaryRef entry = pairs[i].ch;    /* s2 */
+            CFDictionaryRef entry1 = pairs[i].ch1;  /* s1 */
+            CFStringRef name = ior_ChannelGetChannelName(entry);
+            CFStringRef subgroup = ior_ChannelGetSubGroup(entry);
+            int32_t fmt = ior_ChannelGetFormat(entry);
+
+            if (!name) continue;
+
+            /* GPU Energy (Simple, delta = s2 - s1 nanojoules) */
+            if (fmt == kIOReportFormatSimple && cfstr_eq(name, "GPU Energy")) {
+                int64_t e2 = ior_SimpleGetIntegerValue(entry, NULL);
+                int64_t e1 = ior_SimpleGetIntegerValue(entry1, NULL);
+                int64_t energy_nj = e2 - e1;
+                double watts = (double)energy_nj / (interval * 1e9);
+
+                PyObject *v;
+                v = PyFloat_FromDouble(watts);
+                PyDict_SetItemString(result, "gpu_power_w", v);
+                Py_DECREF(v);
+                v = PyLong_FromLongLong(energy_nj);
+                PyDict_SetItemString(result, "gpu_energy_nj", v);
+                Py_DECREF(v);
+            }
+
+            /* GPU Performance States (State, delta = s2 - s1 residency) */
+            if (fmt == kIOReportFormatState && cfstr_eq(name, "GPUPH")) {
+                int32_t state_count = ior_StateGetCount(entry);
+                int64_t total_res = 0;
+                for (int32_t s = 0; s < state_count; s++) {
+                    int64_t r2 = ior_StateGetResidency(entry, s);
+                    int64_t r1 = ior_StateGetResidency(entry1, s);
+                    total_res += (r2 - r1);
+                }
+
+                for (int32_t s = 0; s < state_count; s++) {
+                    CFStringRef sname = ior_StateGetNameForIndex(entry, s);
+                    int64_t r2 = ior_StateGetResidency(entry, s);
+                    int64_t r1 = ior_StateGetResidency(entry1, s);
+                    int64_t res = r2 - r1;
+                    if (res <= 0 || !sname) continue;
+
+                    double pct = total_res > 0 ? (double)res / total_res * 100.0 : 0;
+                    /* Skip OFF state in the output */
+                    if (cfstr_eq(sname, "OFF")) continue;
+
+                    PyObject *state_dict = PyDict_New();
+                    PyObject *v;
+                    v = cfstr_to_pystr(sname);
+                    PyDict_SetItemString(state_dict, "state", v);
+                    Py_DECREF(v);
+                    v = PyFloat_FromDouble(pct);
+                    PyDict_SetItemString(state_dict, "residency_pct", v);
+                    Py_DECREF(v);
+                    PyList_Append(freq_list, state_dict);
+                    Py_DECREF(state_dict);
+                }
+            }
+
+            /* CLTM-induced throttling (use delta residency) */
+            if (fmt == kIOReportFormatState && cfstr_eq(name, "GPU_CLTM")) {
+                int32_t state_count = ior_StateGetCount(entry);
+                int64_t total_res = 0;
+                int64_t no_cltm_res = 0;
+                for (int32_t s = 0; s < state_count; s++) {
+                    int64_t res = ior_StateGetResidency(entry, s) - ior_StateGetResidency(entry1, s);
+                    total_res += res;
+                    CFStringRef sname = ior_StateGetNameForIndex(entry, s);
+                    if (sname && cfstr_eq(sname, "NO_CLTM"))
+                        no_cltm_res = res;
+                }
+                int throttled = (total_res > 0 && no_cltm_res < total_res);
+                PyObject *v = PyBool_FromLong(throttled);
+                PyDict_SetItemString(result, "throttled", v);
+                Py_DECREF(v);
+            }
+
+            /* Power controller state (delta residency) */
+            if (fmt == kIOReportFormatState && cfstr_eq(name, "PWRCTRL")) {
+                int32_t state_count = ior_StateGetCount(entry);
+                int64_t max_res = 0;
+                CFStringRef best_name = NULL;
+                for (int32_t s = 0; s < state_count; s++) {
+                    int64_t res = ior_StateGetResidency(entry, s) - ior_StateGetResidency(entry1, s);
+                    if (res > max_res) {
+                        max_res = res;
+                        best_name = ior_StateGetNameForIndex(entry, s);
+                    }
+                }
+                if (best_name) {
+                    PyObject *v = cfstr_to_pystr(best_name);
+                    PyDict_SetItemString(result, "active_state", v);
+                    Py_DECREF(v);
+                }
+            }
+
+            /* PPM power limit (delta residency) */
+            if (fmt == kIOReportFormatState && cfstr_eq(name, "GPU_PPM")) {
+                int32_t state_count = ior_StateGetCount(entry);
+                int64_t max_res = 0;
+                CFStringRef best_name = NULL;
+                for (int32_t s = 0; s < state_count; s++) {
+                    int64_t res = ior_StateGetResidency(entry, s) - ior_StateGetResidency(entry1, s);
+                    if (res > max_res) {
+                        max_res = res;
+                        best_name = ior_StateGetNameForIndex(entry, s);
+                    }
+                }
+                if (best_name) {
+                    char buf[32];
+                    if (CFStringGetCString(best_name, buf, sizeof(buf), kCFStringEncodingUTF8)) {
+                        int pct = 100;
+                        sscanf(buf, "%d%%", &pct);
+                        PyObject *v = PyLong_FromLong(pct);
+                        PyDict_SetItemString(result, "power_limit_pct", v);
+                        Py_DECREF(v);
+                    }
+                }
+            }
+        }
+    }
+
+    /* Parse temperatures from "TgXa Max" channels (absolute from s2).
+     * IOReport provides Sum, Sum Count, Min, Max per sensor.
+     * We use "Max" as the instantaneous reading. */
+    {
+        for (int i = 0; i < n_pairs; i++) {
+            CFDictionaryRef entry = pairs[i].ch;
+            CFStringRef name = ior_ChannelGetChannelName(entry);
+            int32_t fmt = ior_ChannelGetFormat(entry);
+
+            if (!name || fmt != kIOReportFormatSimple) continue;
+
+            char name_buf[128];
+            if (!CFStringGetCString(name, name_buf, sizeof(name_buf), kCFStringEncodingUTF8))
+                continue;
+
+            /* Match "TgXXa Max" pattern */
+            if (strncmp(name_buf, "Tg", 2) != 0) continue;
+            size_t nlen = strlen(name_buf);
+            /* Check for " Max" suffix */
+            if (nlen < 7) continue;
+            if (strcmp(name_buf + nlen - 4, " Max") != 0) continue;
+            name_buf[nlen - 4] = '\0';  /* truncate " Max" */
+
+            int64_t raw = ior_SimpleGetIntegerValue(entry, NULL);
+            /* Temperature value scale depends on kernel version.
+             * Values >10000 are likely milli-degrees, >1000 centi-degrees. */
+            double temp_c;
+            if (raw > 100000)
+                temp_c = (double)raw / 1000.0;  /* milli-degrees */
+            else if (raw > 10000)
+                temp_c = (double)raw / 100.0;   /* centi-degrees */
+            else
+                temp_c = (double)raw;            /* already Celsius */
+
+            if (temp_c > 0 && temp_c < 200) {
+                PyObject *v = PyFloat_FromDouble(temp_c);
+                PyDict_SetItemString(sensors_dict, name_buf, v);
+                Py_DECREF(v);
+                temp_sum += (long long)(temp_c * 100);
+                temp_count++;
+            }
+        }
+    }
+
+    /* Add temperature data */
+    if (temp_count > 0) {
+        double avg = (double)temp_sum / (temp_count * 100);
+        PyObject *v = PyFloat_FromDouble(avg);
+        PyDict_SetItemString(temps_dict, "avg", v);
+        Py_DECREF(v);
+    }
+    PyDict_SetItemString(temps_dict, "sensors", sensors_dict);
+    Py_DECREF(sensors_dict);
+    PyDict_SetItemString(result, "temperatures", temps_dict);
+    Py_DECREF(temps_dict);
+
+    /* Add frequency states */
+    PyDict_SetItemString(result, "frequency_states", freq_list);
+    Py_DECREF(freq_list);
+
+    /* Cleanup */
+    free(pairs);
+    CFRelease(s1_keep);
+    CFRelease(s2);
+    CFRelease(channels);
+    CFRelease(energy_group);
+    CFRelease(gpu_group);
+
+    return result;
+}
+
+
+/* ------------------------------------------------------------------ */
 /* Module definition                                                   */
 /* ------------------------------------------------------------------ */
 
@@ -608,6 +1131,7 @@ static PyMethodDef methods[] = {
     {"proc_info",         py_proc_info,         METH_VARARGS, proc_info_doc},
     {"system_gpu_stats",  py_system_gpu_stats,  METH_NOARGS,  system_gpu_stats_doc},
     {"ppid",              py_ppid,              METH_VARARGS, ppid_doc},
+    {"gpu_power",         py_gpu_power,         METH_VARARGS, gpu_power_doc},
     {NULL, NULL, 0, NULL}
 };
 
