@@ -597,6 +597,74 @@ static PyObject* py_ppid(PyObject* self, PyObject* args) {
 
 
 /* ------------------------------------------------------------------ */
+/* GPU DVFS frequency table from pmgr IOService                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Read the GPU DVFS frequency table from the "pmgr" (power manager)
+ * IOService entry. The "voltage-states9" property contains pairs of
+ * (frequency_hz, voltage) as little-endian uint32s.
+ *
+ * Returns a Python list of frequencies in MHz, ordered by P-state index.
+ * P1 = index 0, P2 = index 1, etc. The OFF state has no entry.
+ */
+
+PyDoc_STRVAR(gpu_freq_table_doc,
+"gpu_freq_table() -> list[int]\n\n"
+"Return the GPU DVFS frequency table in MHz, one entry per P-state.\n\n"
+"Reads 'voltage-states9' from the pmgr IOService. Index 0 = P1 frequency,\n"
+"index 1 = P2, etc. Empty list if the table cannot be read.\n\n"
+"Example::\n\n"
+"    >>> gpu_freq_table()\n"
+"    [338, 618, 796, 924, 952, 1056, 1062, 1182, 1182, 1312, 1242, 1380, 1326, 1470, 1578]\n");
+
+static PyObject* py_gpu_freq_table(PyObject* self, PyObject* args) {
+    io_iterator_t iter;
+    kern_return_t kr = IOServiceGetMatchingServices(
+        kIOMainPortDefault,
+        IOServiceMatching("AppleARMIODevice"),
+        &iter);
+    if (kr != KERN_SUCCESS)
+        return PyList_New(0);
+
+    PyObject *result = PyList_New(0);
+    io_service_t service;
+    while ((service = IOIteratorNext(iter)) != 0) {
+        io_name_t name;
+        IORegistryEntryGetName(service, name);
+        if (strcmp(name, "pmgr") != 0) {
+            IOObjectRelease(service);
+            continue;
+        }
+
+        CFDataRef data = IORegistryEntryCreateCFProperty(
+            service, CFSTR("voltage-states9"),
+            kCFAllocatorDefault, 0);
+        if (data && CFGetTypeID(data) == CFDataGetTypeID()) {
+            CFIndex length = CFDataGetLength(data);
+            const uint8_t *ptr = CFDataGetBytePtr(data);
+
+            /* Each entry is 8 bytes: uint32 freq_hz + uint32 voltage */
+            for (CFIndex i = 0; i + 7 < length; i += 8) {
+                uint32_t freq_hz;
+                memcpy(&freq_hz, ptr + i, 4);
+                if (freq_hz == 0) continue;
+                long freq_mhz = freq_hz / 1000000;
+                PyObject *v = PyLong_FromLong(freq_mhz);
+                PyList_Append(result, v);
+                Py_DECREF(v);
+            }
+        }
+        if (data) CFRelease(data);
+        IOObjectRelease(service);
+        break;
+    }
+    IOObjectRelease(iter);
+    return result;
+}
+
+
+/* ------------------------------------------------------------------ */
 /* GPU power/frequency/temperature via libIOReport                     */
 /* ------------------------------------------------------------------ */
 
@@ -924,6 +992,42 @@ static PyObject* py_gpu_power(PyObject* self, PyObject* args) {
     /* Frequency states list */
     PyObject *freq_list = PyList_New(0);
 
+    /* Read GPU DVFS frequency table for MHz mapping */
+    #define MAX_PSTATES 32
+    long dvfs_mhz[MAX_PSTATES];
+    int dvfs_count = 0;
+    {
+        io_iterator_t dvfs_iter;
+        kern_return_t dvfs_kr = IOServiceGetMatchingServices(
+            kIOMainPortDefault, IOServiceMatching("AppleARMIODevice"), &dvfs_iter);
+        if (dvfs_kr == KERN_SUCCESS) {
+            io_service_t svc;
+            while ((svc = IOIteratorNext(dvfs_iter)) != 0) {
+                io_name_t svc_name;
+                IORegistryEntryGetName(svc, svc_name);
+                if (strcmp(svc_name, "pmgr") == 0) {
+                    CFDataRef dvfs_data = IORegistryEntryCreateCFProperty(
+                        svc, CFSTR("voltage-states9"), kCFAllocatorDefault, 0);
+                    if (dvfs_data && CFGetTypeID(dvfs_data) == CFDataGetTypeID()) {
+                        CFIndex len = CFDataGetLength(dvfs_data);
+                        const uint8_t *p = CFDataGetBytePtr(dvfs_data);
+                        for (CFIndex off = 0; off + 7 < len && dvfs_count < MAX_PSTATES; off += 8) {
+                            uint32_t fhz;
+                            memcpy(&fhz, p + off, 4);
+                            if (fhz > 0)
+                                dvfs_mhz[dvfs_count++] = fhz / 1000000;
+                        }
+                    }
+                    if (dvfs_data) CFRelease(dvfs_data);
+                    IOObjectRelease(svc);
+                    break;
+                }
+                IOObjectRelease(svc);
+            }
+            IOObjectRelease(dvfs_iter);
+        }
+    }
+
     if (n_pairs > 0) {
         for (int i = 0; i < n_pairs; i++) {
             CFDictionaryRef entry = pairs[i].ch;    /* s2 */
@@ -960,6 +1064,9 @@ static PyObject* py_gpu_power(PyObject* self, PyObject* args) {
                     total_res += (r2 - r1);
                 }
 
+                double weighted_freq = 0;
+                double active_pct = 0;
+
                 for (int32_t s = 0; s < state_count; s++) {
                     CFStringRef sname = ior_StateGetNameForIndex(entry, s);
                     int64_t r2 = ior_StateGetResidency(entry, s);
@@ -971,6 +1078,21 @@ static PyObject* py_gpu_power(PyObject* self, PyObject* args) {
                     /* Skip OFF state in the output */
                     if (cfstr_eq(sname, "OFF")) continue;
 
+                    /* Map P-state name to frequency via DVFS table.
+                     * State names are "P1", "P2", etc. Parse the number. */
+                    char sbuf[16];
+                    long freq = 0;
+                    if (CFStringGetCString(sname, sbuf, sizeof(sbuf), kCFStringEncodingUTF8)
+                        && sbuf[0] == 'P') {
+                        int pindex = atoi(sbuf + 1);
+                        if (pindex >= 1 && pindex <= dvfs_count)
+                            freq = dvfs_mhz[pindex - 1];
+                    }
+
+                    active_pct += pct;
+                    if (freq > 0)
+                        weighted_freq += freq * (pct / 100.0);
+
                     PyObject *state_dict = PyDict_New();
                     PyObject *v;
                     v = cfstr_to_pystr(sname);
@@ -979,8 +1101,21 @@ static PyObject* py_gpu_power(PyObject* self, PyObject* args) {
                     v = PyFloat_FromDouble(pct);
                     PyDict_SetItemString(state_dict, "residency_pct", v);
                     Py_DECREF(v);
+                    if (freq > 0) {
+                        v = PyLong_FromLong(freq);
+                        PyDict_SetItemString(state_dict, "freq_mhz", v);
+                        Py_DECREF(v);
+                    }
                     PyList_Append(freq_list, state_dict);
                     Py_DECREF(state_dict);
+                }
+
+                /* Weighted average GPU frequency */
+                if (active_pct > 0) {
+                    double avg_freq = weighted_freq / (active_pct / 100.0);
+                    PyObject *v = PyLong_FromLong((long)avg_freq);
+                    PyDict_SetItemString(result, "gpu_freq_mhz", v);
+                    Py_DECREF(v);
                 }
             }
 
@@ -1132,6 +1267,7 @@ static PyMethodDef methods[] = {
     {"system_gpu_stats",  py_system_gpu_stats,  METH_NOARGS,  system_gpu_stats_doc},
     {"ppid",              py_ppid,              METH_VARARGS, ppid_doc},
     {"gpu_power",         py_gpu_power,         METH_VARARGS, gpu_power_doc},
+    {"gpu_freq_table",    py_gpu_freq_table,    METH_NOARGS,  gpu_freq_table_doc},
     {NULL, NULL, 0, NULL}
 };
 

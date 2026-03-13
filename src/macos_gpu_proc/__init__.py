@@ -41,6 +41,7 @@ from typing import Any
 from ._native import (
     cpu_time_ns,
     gpu_clients,
+    gpu_freq_table,
     gpu_power,
     gpu_time_ns,
     gpu_time_ns_multi,
@@ -53,6 +54,7 @@ __all__ = [
     "GpuMonitor",
     "cpu_time_ns",
     "gpu_clients",
+    "gpu_freq_table",
     "gpu_power",
     "gpu_time_ns",
     "gpu_time_ns_multi",
@@ -64,7 +66,7 @@ __all__ = [
     "system_gpu_stats",
 ]
 
-__version__ = "0.1.7"
+__version__ = "0.1.8"
 
 
 def _snapshot() -> dict[int, dict]:

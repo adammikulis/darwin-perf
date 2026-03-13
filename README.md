@@ -36,13 +36,23 @@ from macos_gpu_proc import gpu_power
 
 power = gpu_power(interval=1.0)  # samples over 1 second
 print(f"GPU Power: {power['gpu_power_w']:.2f}W")
+print(f"GPU Freq:  {power['gpu_freq_mhz']} MHz (weighted avg)")
 print(f"Throttled: {power['throttled']}")
-print(f"Active state: {power['active_state']}")
 for state in power['frequency_states']:
-    print(f"  {state['state']}: {state['residency_pct']:.1f}%")
+    print(f"  {state['state']}: {state['freq_mhz']}MHz ({state['residency_pct']:.1f}%)")
 ```
 
 Uses `libIOReport.dylib` (the same data source as `powermetrics`). No sudo needed.
+
+### GPU DVFS Frequency Table
+
+```python
+from macos_gpu_proc import gpu_freq_table
+
+for i, freq in enumerate(gpu_freq_table()):
+    print(f"P{i+1}: {freq} MHz")
+# P1: 338 MHz, P2: 618 MHz, ..., P15: 1578 MHz
+```
 
 ### System-Wide GPU
 
@@ -119,7 +129,8 @@ python -m macos_gpu_proc  # alternative entry point (same as gpu-proc)
 | `cpu_time_ns(pid)` | Cumulative CPU nanoseconds (user + system) |
 | `proc_info(pid)` | Full process stats (CPU, memory, energy, disk, threads) |
 | `system_gpu_stats()` | System GPU: utilization %, VRAM, model, core count |
-| `gpu_power(interval)` | GPU power (watts), frequency states, thermal throttling via IOReport |
+| `gpu_power(interval)` | GPU power (watts), frequency (MHz), P-state residency, thermal throttling |
+| `gpu_freq_table()` | GPU DVFS frequency table (MHz per P-state) from pmgr |
 | `ppid(pid)` | Parent process ID for a PID (-1 on error) |
 
 ### proc_info fields
