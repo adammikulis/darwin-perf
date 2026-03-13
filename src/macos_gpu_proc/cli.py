@@ -18,7 +18,6 @@ import signal
 import sys
 import time
 
-from collections import defaultdict
 
 
 def _format_table(

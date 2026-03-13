@@ -16,7 +16,6 @@ import json
 import os
 import threading
 import time
-from collections import defaultdict
 
 _HTML = """<!DOCTYPE html>
 <html>
@@ -308,7 +307,7 @@ class _GpuGuiApi:
                     js = f"update({json.dumps(data)})"
                     self._window.evaluate_js(js)
             except Exception as e:
-                print(f"Poll error: {e}")
+                print(f"Poll error: {e}", file=__import__('sys').stderr)
             time.sleep(self.interval)
 
 

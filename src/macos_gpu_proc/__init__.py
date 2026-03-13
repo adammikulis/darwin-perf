@@ -242,7 +242,7 @@ class GpuMonitor:
 
         Returns:
             Dict with keys: gpu_pct_avg, gpu_pct_min, gpu_pct_max,
-            gpu_pct_peak, num_samples.
+            num_samples.
         """
         if not self._samples:
             return {"gpu_pct_avg": 0, "gpu_pct_min": 0, "gpu_pct_max": 0, "num_samples": 0}

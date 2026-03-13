@@ -11,7 +11,6 @@ Usage:
 from __future__ import annotations
 
 import time as _time
-from collections import defaultdict
 
 from textual.app import App, ComposeResult
 from textual.containers import Vertical
