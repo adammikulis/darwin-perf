@@ -78,20 +78,20 @@ def main() -> None:
 
     # GUI mode
     if args.gui:
-        from macos_gpu_proc.gui import run_gui
+        from darwin_perf.gui import run_gui
 
         run_gui(interval=args.interval)
         return
 
     # TUI mode
     if args.tui:
-        from macos_gpu_proc.tui import run_tui
+        from darwin_perf.tui import run_tui
 
         run_tui(pids=args.pid, interval=args.interval, top_n=args.top)
         return
 
-    from macos_gpu_proc import _snapshot
-    from macos_gpu_proc._native import cpu_time_ns, proc_info
+    from darwin_perf import _snapshot
+    from darwin_perf._native import cpu_time_ns, proc_info
 
     if args.once:
         args.count = 1

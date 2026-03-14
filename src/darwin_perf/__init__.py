@@ -1,34 +1,29 @@
-"""Per-process GPU utilization monitoring for macOS Apple Silicon.
+"""darwin-perf: System performance monitoring for macOS Apple Silicon.
 
-Reads per-client GPU accounting from the IORegistry's AGXDeviceUserClient
-entries — the same data source Activity Monitor uses. No sudo or
-entitlements required.
+GPU, CPU, memory, energy, and disk I/O metrics via Mach kernel APIs
+and IORegistry — the same data sources Activity Monitor uses. No sudo
+or entitlements required.
 
 Quick start::
 
-    from macos_gpu_proc import GpuMonitor
+    from darwin_perf import GpuMonitor
 
     monitor = GpuMonitor()           # tracks the current process
     # ... do some GPU work ...
     print(f"GPU: {monitor.sample():.1f}%")
 
-Or as a context manager with automatic summary::
+System-wide stats (instant, no subprocess)::
 
-    with GpuMonitor() as mon:
-        # ... training loop ...
-        pass
-    print(mon.summary())  # {'gpu_pct_avg': 42.1, 'gpu_pct_peak': 87.3, ...}
+    from darwin_perf import system_stats
+    s = system_stats()
+    print(f"RAM: {s['memory_used']/1e9:.1f} / {s['memory_total']/1e9:.1f} GB")
+    print(f"CPU: {100 - s['cpu_idle_pct']:.1f}%")
 
-Monitor any process (no privileges needed)::
+GPU power and frequency::
 
-    monitor = GpuMonitor(pid=12345)
-    print(monitor.sample())
-
-List all GPU clients::
-
-    from macos_gpu_proc import gpu_clients
-    for c in gpu_clients():
-        print(f"PID {c['pid']} ({c['name']}): {c['gpu_ns']/1e9:.1f}s")
+    from darwin_perf import gpu_power
+    p = gpu_power(0.1)
+    print(f"{p['gpu_power_w']:.1f}W  {p['gpu_freq_mhz']}MHz  throttled={p['throttled']}")
 """
 
 from __future__ import annotations
@@ -48,6 +43,7 @@ from ._native import (
     ppid,
     proc_info,
     system_gpu_stats,
+    system_stats,
 )
 
 __all__ = [
@@ -64,9 +60,10 @@ __all__ = [
     "sample_gpu",
     "snapshot",
     "system_gpu_stats",
+    "system_stats",
 ]
 
-__version__ = "0.1.8"
+__version__ = "0.2.0"
 
 
 def _snapshot() -> dict[int, dict]:
@@ -161,7 +158,7 @@ def snapshot(
 
     Example::
 
-        from macos_gpu_proc import snapshot
+        from darwin_perf import snapshot
 
         for proc in snapshot():
             print(f"{proc['name']:20s}  GPU {proc['gpu_percent']:5.1f}%  "

@@ -14,8 +14,6 @@ from __future__ import annotations
 
 import json
 import os
-import resource
-import subprocess
 import threading
 import time
 
@@ -187,17 +185,6 @@ window.addEventListener('resize', drawChart);
 </html>"""
 
 
-def _get_hw_memsize() -> int:
-    """Read hw.memsize (total physical memory in bytes). Cached at module level."""
-    try:
-        return int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip())
-    except Exception:
-        return 0
-
-
-# Cache at import time — physical memory never changes
-_HW_MEMSIZE = _get_hw_memsize()
-_PAGE_SIZE = resource.getpagesize()
 
 
 class _GpuGuiApi:
@@ -218,8 +205,8 @@ class _GpuGuiApi:
         t.start()
 
     def _collect(self) -> dict:
-        from macos_gpu_proc import _snapshot
-        from macos_gpu_proc._native import cpu_time_ns, proc_info
+        from darwin_perf import _snapshot
+        from darwin_perf._native import cpu_time_ns, proc_info
 
         now = time.monotonic()
         snap = _snapshot()
@@ -268,22 +255,12 @@ class _GpuGuiApi:
             data["total_gpu_pct"] = 0
             data["total_cpu_pct"] = 0
 
-        # System memory — hw.memsize is cached, only vm_stat is polled
-        data["memory_total_gb"] = round(_HW_MEMSIZE / (1024**3), 1)
-        try:
-            vm = subprocess.check_output(["vm_stat"], text=True)
-            pages: dict[str, int] = {}
-            for line in vm.splitlines():
-                if ":" in line:
-                    k, _, v = line.partition(":")
-                    v = v.strip().rstrip(".")
-                    if v.isdigit():
-                        pages[k.strip()] = int(v)
-            used = (pages.get("Pages active", 0) + pages.get("Pages wired down", 0)
-                    + pages.get("Pages occupied by compressor", 0)) * _PAGE_SIZE
-            data["memory_used_gb"] = round(used / (1024**3), 1)
-        except Exception:
-            data["memory_used_gb"] = 0
+        # System memory via Mach APIs (no subprocess)
+        from darwin_perf._native import system_stats
+        sys = system_stats()
+        GB = 1024**3
+        data["memory_total_gb"] = round(sys.get("memory_total", 0) / GB, 1)
+        data["memory_used_gb"] = round(sys.get("memory_used", 0) / GB, 1)
 
         self._prev_snap = snap
         self._prev_cpu = curr_cpu
@@ -292,8 +269,8 @@ class _GpuGuiApi:
 
     def _poll_loop(self) -> None:
         # Take initial baseline
-        from macos_gpu_proc import _snapshot
-        from macos_gpu_proc._native import cpu_time_ns
+        from darwin_perf import _snapshot
+        from darwin_perf._native import cpu_time_ns
         self._prev_snap = _snapshot()
         for pid in self._prev_snap:
             ns = cpu_time_ns(pid)

@@ -3,9 +3,9 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "macos-gpu-proc"
-version = "0.1.8"
-description = "Per-process GPU utilization, CPU, memory, and energy monitoring for macOS Apple Silicon — no sudo needed."
+name = "darwin-perf"
+version = "0.2.0"
+description = "System performance monitoring for macOS Apple Silicon — GPU, CPU, memory, energy, disk I/O via Mach APIs. No sudo needed."
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
@@ -26,7 +26,7 @@ classifiers = [
     "Topic :: System :: Monitoring",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-keywords = ["macos", "gpu", "monitoring", "apple-silicon", "metal", "mlx", "pytorch", "mps", "m1", "m2", "m3", "m4", "m5"]
+keywords = ["macos", "darwin", "gpu", "cpu", "monitoring", "performance", "apple-silicon", "metal", "mlx", "pytorch", "mps", "m1", "m2", "m3", "m4", "m5"]
 
 [project.optional-dependencies]
 tui = ["textual>=0.40"]
@@ -34,11 +34,11 @@ gui = ["pywebview>=5.0"]
 all = ["textual>=0.40", "pywebview>=5.0"]
 
 [project.scripts]
-gpu-proc = "macos_gpu_proc.cli:main"
+darwin-perf = "darwin_perf.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/adammikulis/macos-gpu-proc"
-Issues = "https://github.com/adammikulis/macos-gpu-proc/issues"
+Homepage = "https://github.com/adammikulis/darwin-perf"
+Issues = "https://github.com/adammikulis/darwin-perf/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

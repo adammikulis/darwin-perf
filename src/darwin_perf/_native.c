@@ -1,5 +1,5 @@
 /**
- * macos-gpu-proc: Per-process GPU utilization on macOS Apple Silicon.
+ * darwin-perf: System performance monitoring for macOS Apple Silicon.
  *
  * Reads per-client GPU accounting from the IORegistry's AGXDeviceUserClient
  * entries. Each GPU client (Metal command queue) is a child of the AGX
@@ -20,6 +20,10 @@
 #include <libproc.h>
 #include <sys/proc_info.h>
 #include <sys/resource.h>
+#include <sys/sysctl.h>
+#include <mach/mach.h>
+#include <mach/host_info.h>
+#include <mach/mach_host.h>
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -1255,6 +1259,116 @@ static PyObject* py_gpu_power(PyObject* self, PyObject* args) {
 
 
 /* ------------------------------------------------------------------ */
+/* system_stats() — system-wide CPU + memory via Mach host APIs        */
+/* ------------------------------------------------------------------ */
+
+PyDoc_STRVAR(system_stats_doc,
+"system_stats() -> dict\n\n"
+"Return system-wide CPU and memory statistics via Mach host APIs.\n\n"
+"No subprocess calls, no sudo, no psutil. Uses the same Mach APIs\n"
+"that Activity Monitor uses internally.\n\n"
+"Returns dict with keys:\n"
+"    - 'memory_total': int — total physical memory in bytes\n"
+"    - 'memory_used': int — active + wired memory in bytes\n"
+"    - 'memory_available': int — free + inactive + speculative in bytes\n"
+"    - 'memory_active': int — active pages in bytes\n"
+"    - 'memory_inactive': int — inactive pages in bytes\n"
+"    - 'memory_wired': int — wired (non-pageable) in bytes\n"
+"    - 'memory_free': int — free pages in bytes\n"
+"    - 'memory_compressed': int — compressed pages in bytes\n"
+"    - 'cpu_count': int — logical CPU core count\n"
+"    - 'cpu_user_pct': float — user CPU percent (since boot)\n"
+"    - 'cpu_system_pct': float — system CPU percent (since boot)\n"
+"    - 'cpu_idle_pct': float — idle CPU percent (since boot)\n"
+"    - 'cpu_name': str — CPU brand string\n"
+);
+
+static PyObject* py_system_stats(PyObject* self, PyObject* args) {
+    (void)self; (void)args;
+
+    PyObject *result = PyDict_New();
+    if (!result) return NULL;
+
+    /* --- Physical memory total via sysctl --- */
+    uint64_t mem_total = 0;
+    size_t mem_size = sizeof(mem_total);
+    if (sysctlbyname("hw.memsize", &mem_total, &mem_size, NULL, 0) == 0) {
+        PyObject *v = PyLong_FromUnsignedLongLong(mem_total);
+        PyDict_SetItemString(result, "memory_total", v);
+        Py_DECREF(v);
+    }
+
+    /* --- VM statistics via host_statistics64 --- */
+    mach_port_t host = mach_host_self();
+    vm_size_t page_size = 0;
+    host_page_size(host, &page_size);
+
+    vm_statistics64_data_t vm_stat;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&vm_stat, &count) == KERN_SUCCESS) {
+        uint64_t active    = (uint64_t)vm_stat.active_count * page_size;
+        uint64_t inactive  = (uint64_t)vm_stat.inactive_count * page_size;
+        uint64_t wired     = (uint64_t)vm_stat.wire_count * page_size;
+        uint64_t free_mem  = (uint64_t)vm_stat.free_count * page_size;
+        uint64_t speculative = (uint64_t)vm_stat.speculative_count * page_size;
+        uint64_t compressed = (uint64_t)vm_stat.compressor_page_count * page_size;
+        uint64_t used      = active + wired + compressed;
+        uint64_t available = free_mem + inactive + speculative;
+
+        PyObject *v;
+        v = PyLong_FromUnsignedLongLong(used); PyDict_SetItemString(result, "memory_used", v); Py_DECREF(v);
+        v = PyLong_FromUnsignedLongLong(available); PyDict_SetItemString(result, "memory_available", v); Py_DECREF(v);
+        v = PyLong_FromUnsignedLongLong(active); PyDict_SetItemString(result, "memory_active", v); Py_DECREF(v);
+        v = PyLong_FromUnsignedLongLong(inactive); PyDict_SetItemString(result, "memory_inactive", v); Py_DECREF(v);
+        v = PyLong_FromUnsignedLongLong(wired); PyDict_SetItemString(result, "memory_wired", v); Py_DECREF(v);
+        v = PyLong_FromUnsignedLongLong(free_mem); PyDict_SetItemString(result, "memory_free", v); Py_DECREF(v);
+        v = PyLong_FromUnsignedLongLong(compressed); PyDict_SetItemString(result, "memory_compressed", v); Py_DECREF(v);
+    }
+
+    /* --- CPU load via host_statistics (ticks since boot) --- */
+    host_cpu_load_info_data_t cpu_load;
+    count = HOST_CPU_LOAD_INFO_COUNT;
+    if (host_statistics(host, HOST_CPU_LOAD_INFO, (host_info_t)&cpu_load, &count) == KERN_SUCCESS) {
+        uint64_t user   = cpu_load.cpu_ticks[CPU_STATE_USER] + cpu_load.cpu_ticks[CPU_STATE_NICE];
+        uint64_t sys    = cpu_load.cpu_ticks[CPU_STATE_SYSTEM];
+        uint64_t idle   = cpu_load.cpu_ticks[CPU_STATE_IDLE];
+        uint64_t total  = user + sys + idle;
+        if (total > 0) {
+            PyObject *v;
+            v = PyFloat_FromDouble(100.0 * user / total); PyDict_SetItemString(result, "cpu_user_pct", v); Py_DECREF(v);
+            v = PyFloat_FromDouble(100.0 * sys / total); PyDict_SetItemString(result, "cpu_system_pct", v); Py_DECREF(v);
+            v = PyFloat_FromDouble(100.0 * idle / total); PyDict_SetItemString(result, "cpu_idle_pct", v); Py_DECREF(v);
+        }
+        /* Raw ticks for delta computation (instant CPU% between polls) */
+        PyObject *v;
+        v = PyLong_FromUnsignedLongLong(user); PyDict_SetItemString(result, "cpu_ticks_user", v); Py_DECREF(v);
+        v = PyLong_FromUnsignedLongLong(sys); PyDict_SetItemString(result, "cpu_ticks_system", v); Py_DECREF(v);
+        v = PyLong_FromUnsignedLongLong(idle); PyDict_SetItemString(result, "cpu_ticks_idle", v); Py_DECREF(v);
+    }
+
+    /* --- CPU count --- */
+    int cpu_count = 0;
+    size_t cpu_size = sizeof(cpu_count);
+    if (sysctlbyname("hw.logicalcpu", &cpu_count, &cpu_size, NULL, 0) == 0) {
+        PyObject *v = PyLong_FromLong(cpu_count);
+        PyDict_SetItemString(result, "cpu_count", v);
+        Py_DECREF(v);
+    }
+
+    /* --- CPU brand string --- */
+    char cpu_brand[256] = {0};
+    size_t brand_size = sizeof(cpu_brand);
+    if (sysctlbyname("machdep.cpu.brand_string", cpu_brand, &brand_size, NULL, 0) == 0) {
+        PyObject *v = PyUnicode_FromString(cpu_brand);
+        PyDict_SetItemString(result, "cpu_name", v);
+        Py_DECREF(v);
+    }
+
+    return result;
+}
+
+
+/* ------------------------------------------------------------------ */
 /* Module definition                                                   */
 /* ------------------------------------------------------------------ */
 
@@ -1268,6 +1382,7 @@ static PyMethodDef methods[] = {
     {"ppid",              py_ppid,              METH_VARARGS, ppid_doc},
     {"gpu_power",         py_gpu_power,         METH_VARARGS, gpu_power_doc},
     {"gpu_freq_table",    py_gpu_freq_table,    METH_NOARGS,  gpu_freq_table_doc},
+    {"system_stats",      py_system_stats,      METH_NOARGS,  system_stats_doc},
     {NULL, NULL, 0, NULL}
 };
 
