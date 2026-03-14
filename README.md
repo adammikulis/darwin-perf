@@ -16,8 +16,8 @@ pip install darwin-perf
 from darwin_perf import temperatures
 
 t = temperatures()
-print(f"CPU: {t['cpu_avg']:.1f}°C  GPU: {t['gpu_avg']:.1f}°C  System: {t['system_avg']:.1f}°C")
-# CPU: 40.1°C  GPU: 36.5°C  System: 31.2°C
+print(f"CPU: {t['cpu_avg']:.1f}°C  GPU: {t['gpu_avg']:.1f}°C")
+# CPU: 40.1°C  GPU: 36.5°C
 
 # Individual sensors
 for name, temp in t['cpu_sensors'].items():
@@ -31,8 +31,8 @@ from darwin_perf import cpu_power
 
 c = cpu_power(interval=0.5)
 print(f"CPU Power: {c['cpu_power_w']:.2f}W")
-for name, cluster in c['clusters'].items():
-    print(f"  {name}: {cluster['freq_mhz']} MHz, {cluster['active_pct']:.0f}% active")
+for name, cl in c['clusters'].items():
+    print(f"  {name}: {cl['freq_mhz']} MHz, {cl['active_pct']:.0f}%")
 # ECPU: 663 MHz, 100% active
 # PCPU: 1272 MHz, 100% active
 ```
@@ -43,9 +43,11 @@ for name, cluster in c['clusters'].items():
 from darwin_perf import gpu_power
 
 g = gpu_power(interval=0.5)
-print(f"GPU: {g['gpu_power_w']:.2f}W  {g['gpu_freq_mhz']}MHz  throttled={g['throttled']}")
-for state in g['frequency_states']:
-    print(f"  {state['state']}: {state.get('freq_mhz', '?')}MHz ({state['residency_pct']:.1f}%)")
+print(f"GPU: {g['gpu_power_w']:.2f}W  {g['gpu_freq_mhz']}MHz")
+print(f"Throttled: {g['throttled']}")
+for s in g['frequency_states']:
+    mhz = s.get('freq_mhz', '?')
+    print(f"  {s['state']}: {mhz}MHz ({s['residency_pct']:.1f}%)")
 ```
 
 ### Per-Process GPU/CPU Utilization
@@ -109,9 +111,10 @@ print(mon.summary())  # {'gpu_pct_avg': 42.1, 'gpu_pct_max': 87.3, ...}
 ```python
 from darwin_perf import gpu_clients, proc_info
 
-# All GPU clients (raw cumulative data) — includes Metal/GL/CL API type
+# All GPU clients — includes Metal/GL/CL API type
 for c in gpu_clients():
-    print(f"PID {c['pid']} ({c['name']}): {c['gpu_ns']/1e9:.1f}s GPU time [{c['api']}]")
+    ns = c['gpu_ns'] / 1e9
+    print(f"PID {c['pid']} ({c['name']}): {ns:.1f}s [{c['api']}]")
 
 # Per-process stats (CPU, memory, energy, disk I/O, threads)
 info = proc_info(1234)
@@ -135,7 +138,7 @@ darwin-perf --csv        # CSV with header (pipe to file for spreadsheets)
 # Recording & export
 darwin-perf --record session.jsonl         # capture full system state
 darwin-perf --record session.jsonl -n 60   # record 60 samples
-darwin-perf --export session.jsonl         # → session_system.csv + session_processes.csv
+darwin-perf --export session.jsonl         # → _system.csv + _processes.csv
 darwin-perf --replay session.jsonl         # replay with original timing
 ```
 
