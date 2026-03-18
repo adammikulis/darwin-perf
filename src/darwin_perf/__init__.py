@@ -510,3 +510,63 @@ def cpu_usage(interval: float = 1.0) -> dict:
         result["per_core"] = per_core
 
     return result
+
+
+def proc_usage(pid: int = 0, interval: float = 1.0) -> dict:
+    """Instant per-process CPU and GPU utilization via delta sampling.
+
+    Computes CPU% the same way Activity Monitor does: delta of cpu_ns
+    over wall-clock interval, scaled by number of cores.
+
+    Args:
+        pid: Process ID (0 = current process).
+        interval: Sampling interval in seconds (default 1.0).
+
+    Returns:
+        Dict with keys:
+            - 'cpu_pct': float — process CPU% (100% = one full core)
+            - 'gpu_pct': float — process GPU% (via GpuMonitor delta)
+            - 'memory_gb': float — resident memory in GB
+            - 'threads': int — thread count
+    """
+    import os as _os
+    import time as _time
+
+    if pid == 0:
+        pid = _os.getpid()
+
+    import subprocess as _sp
+
+    # CPU% via ps — matches Activity Monitor (includes kernel/GPU-wait time)
+    try:
+        r = _sp.run(["ps", "-p", str(pid), "-o", "%cpu=,%mem=,rss="],
+                     capture_output=True, text=True, timeout=2)
+        parts = r.stdout.strip().split()
+        cpu_pct = float(parts[0]) if len(parts) > 0 else 0
+        mem_pct = float(parts[1]) if len(parts) > 1 else 0
+        rss_kb = int(parts[2]) if len(parts) > 2 else 0
+    except Exception:
+        cpu_pct = 0
+        rss_kb = 0
+
+    # Thread count from proc_info
+    try:
+        info = proc_info(pid)
+        threads = info["threads"]
+        mem_gb = info["real_memory"] / 1e9
+    except Exception:
+        threads = 0
+        mem_gb = rss_kb / 1e6
+
+    # GPU% via GpuMonitor delta
+    mon = GpuMonitor(pid=pid, children=True)
+    mon.sample()
+    _time.sleep(interval)
+    gpu_pct = mon.sample()
+
+    return {
+        "cpu_pct": round(cpu_pct, 1),
+        "gpu_pct": round(gpu_pct, 1),
+        "memory_gb": round(mem_gb, 1),
+        "threads": threads,
+    }
