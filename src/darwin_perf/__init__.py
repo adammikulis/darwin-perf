@@ -446,3 +446,67 @@ class GpuMonitor:
             "gpu_pct_max": max(samples),
             "num_samples": len(samples),
         }
+
+
+def cpu_usage(interval: float = 1.0) -> dict:
+    """Instant CPU utilization via delta sampling.
+
+    Takes two ``system_stats()`` samples separated by ``interval`` seconds
+    and computes the CPU percentage from tick deltas. Reports both overall
+    and per-core utilization.
+
+    Args:
+        interval: Sampling interval in seconds (default 1.0).
+
+    Returns:
+        Dict with keys:
+            - 'overall_pct': float — total CPU active percent
+            - 'user_pct': float — user CPU percent
+            - 'system_pct': float — system CPU percent
+            - 'idle_pct': float — idle CPU percent
+            - 'per_core': list[dict] — per-core active_pct, user_pct, system_pct
+    """
+    import time as _time
+    s1 = system_stats()
+    _time.sleep(interval)
+    s2 = system_stats()
+
+    result = {}
+
+    # Overall delta
+    u1 = s1.get("cpu_ticks_user", 0)
+    s1t = s1.get("cpu_ticks_system", 0)
+    i1 = s1.get("cpu_ticks_idle", 0)
+    u2 = s2.get("cpu_ticks_user", 0)
+    s2t = s2.get("cpu_ticks_system", 0)
+    i2 = s2.get("cpu_ticks_idle", 0)
+    du, ds, di = u2 - u1, s2t - s1t, i2 - i1
+    dt = du + ds + di
+    if dt > 0:
+        result["user_pct"] = round(100.0 * du / dt, 1)
+        result["system_pct"] = round(100.0 * ds / dt, 1)
+        result["idle_pct"] = round(100.0 * di / dt, 1)
+        result["overall_pct"] = round(100.0 * (du + ds) / dt, 1)
+
+    # Per-core delta
+    cores1 = s1.get("per_core", [])
+    cores2 = s2.get("per_core", [])
+    if cores1 and cores2 and len(cores1) == len(cores2):
+        per_core = []
+        for c1, c2 in zip(cores1, cores2):
+            cu = c2["ticks_user"] - c1["ticks_user"]
+            cs = c2["ticks_system"] - c1["ticks_system"]
+            ci = c2["ticks_idle"] - c1["ticks_idle"]
+            ct = cu + cs + ci
+            if ct > 0:
+                per_core.append({
+                    "core": c1["core"],
+                    "active_pct": round(100.0 * (cu + cs) / ct, 1),
+                    "user_pct": round(100.0 * cu / ct, 1),
+                    "system_pct": round(100.0 * cs / ct, 1),
+                })
+            else:
+                per_core.append({"core": c1["core"], "active_pct": 0, "user_pct": 0, "system_pct": 0})
+        result["per_core"] = per_core
+
+    return result

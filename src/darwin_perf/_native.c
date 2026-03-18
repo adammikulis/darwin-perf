@@ -1502,6 +1502,9 @@ PyDoc_STRVAR(system_stats_doc,
 "    - 'cpu_system_pct': float — system CPU percent (since boot)\n"
 "    - 'cpu_idle_pct': float — idle CPU percent (since boot)\n"
 "    - 'cpu_name': str — CPU brand string\n"
+"    - 'per_core': list[dict] — per-core CPU ticks and percentages\n"
+"        Each dict: core, user_pct, system_pct, idle_pct, active_pct,\n"
+"                   ticks_user, ticks_system, ticks_idle\n"
 );
 
 static PyObject* py_system_stats(PyObject* self, PyObject* args) {
@@ -1583,6 +1586,40 @@ static PyObject* py_system_stats(PyObject* self, PyObject* args) {
         PyObject *v = PyUnicode_FromString(cpu_brand);
         PyDict_SetItemString(result, "cpu_name", v);
         Py_DECREF(v);
+    }
+
+    /* --- Per-core CPU ticks via host_processor_info --- */
+    natural_t num_cpus = 0;
+    processor_info_array_t cpu_info = NULL;
+    mach_msg_type_number_t num_cpu_info = 0;
+    kern_return_t kr = host_processor_info(host, PROCESSOR_CPU_LOAD_INFO,
+                                            &num_cpus, &cpu_info, &num_cpu_info);
+    if (kr == KERN_SUCCESS && cpu_info != NULL) {
+        PyObject *per_core = PyList_New(num_cpus);
+        for (natural_t i = 0; i < num_cpus; i++) {
+            integer_t *ticks = &cpu_info[i * CPU_STATE_MAX];
+            uint64_t u = ticks[CPU_STATE_USER] + ticks[CPU_STATE_NICE];
+            uint64_t s = ticks[CPU_STATE_SYSTEM];
+            uint64_t d = ticks[CPU_STATE_IDLE];
+            uint64_t t = u + s + d;
+            PyObject *core_dict = PyDict_New();
+            PyObject *cv;
+            cv = PyLong_FromLong(i); PyDict_SetItemString(core_dict, "core", cv); Py_DECREF(cv);
+            if (t > 0) {
+                cv = PyFloat_FromDouble(100.0 * u / t); PyDict_SetItemString(core_dict, "user_pct", cv); Py_DECREF(cv);
+                cv = PyFloat_FromDouble(100.0 * s / t); PyDict_SetItemString(core_dict, "system_pct", cv); Py_DECREF(cv);
+                cv = PyFloat_FromDouble(100.0 * d / t); PyDict_SetItemString(core_dict, "idle_pct", cv); Py_DECREF(cv);
+                cv = PyFloat_FromDouble(100.0 * (u + s) / t); PyDict_SetItemString(core_dict, "active_pct", cv); Py_DECREF(cv);
+            }
+            cv = PyLong_FromUnsignedLongLong(u); PyDict_SetItemString(core_dict, "ticks_user", cv); Py_DECREF(cv);
+            cv = PyLong_FromUnsignedLongLong(s); PyDict_SetItemString(core_dict, "ticks_system", cv); Py_DECREF(cv);
+            cv = PyLong_FromUnsignedLongLong(d); PyDict_SetItemString(core_dict, "ticks_idle", cv); Py_DECREF(cv);
+            PyList_SetItem(per_core, i, core_dict);
+        }
+        PyDict_SetItemString(result, "per_core", per_core);
+        Py_DECREF(per_core);
+        vm_deallocate(mach_task_self(), (vm_address_t)cpu_info,
+                      num_cpu_info * sizeof(integer_t));
     }
 
     return result;
