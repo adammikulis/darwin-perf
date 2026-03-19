@@ -5,30 +5,22 @@ kernel APIs, IORegistry, and AppleSMC. No sudo needed.
 
 Quick start::
 
-    from darwin_perf import snapshot
+    import darwin_perf as dp
 
-    # Per-process GPU/CPU utilization with system context
-    for proc in snapshot():
-        print(f"{proc['name']:20s}  GPU {proc['gpu_percent']:5.1f}%")
+    # Everything in one call
+    s = dp.stats()
+    print(f"GPU: {s['gpu_util_pct']}% @ {s['gpu_power_w']}W")
+    print(f"CPU: {s['proc_cpu_pct']}%  RAM: {s['ram_used_gb']}GB")
 
-Temperatures (instant, no sudo)::
+    # Per-process stats for a specific PID
+    s = dp.stats(pid=12345, interval=0.1)
+    print(f"Process CPU: {s['proc_cpu_pct']}%  GPU: {s['proc_gpu_pct']}%")
 
-    from darwin_perf import temperatures
-    t = temperatures()
-    print(f"CPU: {t['cpu_avg']:.1f}°C  GPU: {t['gpu_avg']:.1f}°C")
+    # System only (no process, no sleep)
+    s = dp.stats(pid=None)
 
-CPU cluster frequency and power::
-
-    from darwin_perf import cpu_power
-    c = cpu_power(0.5)
-    for name, cluster in c['clusters'].items():
-        print(f"{name}: {cluster['freq_mhz']} MHz")
-
-GPU power, frequency, and thermal::
-
-    from darwin_perf import gpu_power
-    p = gpu_power(0.5)
-    print(f"{p['gpu_power_w']:.1f}W  {p['gpu_freq_mhz']}MHz  throttled={p['throttled']}")
+Lower-level APIs still available: proc_info, system_stats, system_gpu_stats,
+gpu_power, cpu_power, temperatures, snapshot, GpuMonitor.
 """
 
 from __future__ import annotations
@@ -67,6 +59,7 @@ __all__ = [
     "proc_info",
     "sample_gpu",
     "snapshot",
+    "stats",
     "system_gpu_stats",
     "system_stats",
     "temperatures",
@@ -572,3 +565,95 @@ def proc_usage(pid: int = 0, interval: float = 1.0) -> dict:
         "memory_gb": round(mem_gb, 1),
         "threads": threads,
     }
+
+
+def stats(pid: int = 0, interval: float = 0.1) -> dict:
+    """All-in-one system and process stats in a single call.
+
+    Returns everything: per-process CPU/GPU/memory, system GPU power/freq,
+    system memory, per-core CPU, temperatures. One function, one dict.
+
+    Args:
+        pid: Process ID (0 = current process, None = system only).
+        interval: Delta sampling interval for CPU% (default 0.1s).
+
+    Returns:
+        Dict with keys:
+            Process (when pid is set):
+                - proc_cpu_pct, proc_gpu_pct, proc_memory_gb, proc_threads
+            GPU:
+                - gpu_util_pct, gpu_power_w, gpu_freq_mhz, gpu_model,
+                  gpu_cores, gpu_vram_gb, gpu_throttled
+            CPU:
+                - cpu_user_pct, cpu_system_pct, cpu_idle_pct, cpu_count,
+                  cpu_name, per_core (list of {core, active_pct})
+            Memory:
+                - ram_used_gb, ram_total_gb, ram_compressed_gb
+            Thermal:
+                - temp_cpu_avg, temp_gpu_avg
+    """
+    import os as _os
+
+    result = {}
+
+    # --- Process stats (delta-sampled) ---
+    if pid is not None:
+        if pid == 0:
+            pid = _os.getpid()
+        try:
+            pu = proc_usage(pid, interval=interval)
+            result["proc_cpu_pct"] = pu["cpu_pct"]
+            result["proc_gpu_pct"] = pu["gpu_pct"]
+            result["proc_memory_gb"] = pu["memory_gb"]
+            result["proc_threads"] = pu["threads"]
+        except Exception:
+            pass
+
+    # --- GPU ---
+    try:
+        gpu = system_gpu_stats()
+        result["gpu_util_pct"] = gpu.get("device_utilization", 0)
+        result["gpu_model"] = gpu.get("model", "")
+        result["gpu_cores"] = gpu.get("gpu_core_count", 0)
+        result["gpu_vram_gb"] = round(gpu.get("in_use_system_memory", 0) / 1e9, 2)
+    except Exception:
+        pass
+
+    try:
+        gp = gpu_power(0.05)
+        result["gpu_power_w"] = round(gp.get("gpu_power_w", 0), 1)
+        result["gpu_freq_mhz"] = gp.get("gpu_freq_mhz", 0)
+        result["gpu_throttled"] = gp.get("throttled", False)
+    except Exception:
+        pass
+
+    # --- CPU + Memory ---
+    try:
+        sys = system_stats()
+        result["cpu_user_pct"] = round(sys.get("cpu_user_pct", 0), 1)
+        result["cpu_system_pct"] = round(sys.get("cpu_system_pct", 0), 1)
+        result["cpu_idle_pct"] = round(sys.get("cpu_idle_pct", 0), 1)
+        result["cpu_count"] = sys.get("cpu_count", 0)
+        result["cpu_name"] = sys.get("cpu_name", "")
+        result["ram_used_gb"] = round(sys.get("memory_used", 0) / 1e9, 1)
+        result["ram_total_gb"] = round(sys.get("memory_total", 0) / 1e9, 1)
+        result["ram_compressed_gb"] = round(sys.get("memory_compressed", 0) / 1e9, 2)
+
+        per_core = sys.get("per_core", [])
+        if per_core:
+            result["per_core"] = [
+                {"core": c["core"], "active_pct": round(c.get("active_pct", 0), 1)}
+                for c in per_core
+            ]
+    except Exception:
+        pass
+
+    # --- Temperatures ---
+    try:
+        t = temperatures()
+        result["temp_cpu_avg"] = round(t.get("cpu_avg", 0), 1)
+        result["temp_gpu_avg"] = round(t.get("gpu_avg", 0), 1)
+    except Exception:
+        pass
+
+    return result
