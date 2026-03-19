@@ -535,33 +535,35 @@ def proc_usage(pid: int = 0, interval: float = 1.0) -> dict:
     if pid == 0:
         pid = _os.getpid()
 
-    import subprocess as _sp
-
-    # CPU% via ps — matches Activity Monitor (includes kernel/GPU-wait time)
+    # Sample 1: proc_info + GPU baseline
     try:
-        r = _sp.run(["ps", "-p", str(pid), "-o", "%cpu=,%mem=,rss="],
-                     capture_output=True, text=True, timeout=2)
-        parts = r.stdout.strip().split()
-        cpu_pct = float(parts[0]) if len(parts) > 0 else 0
-        mem_pct = float(parts[1]) if len(parts) > 1 else 0
-        rss_kb = int(parts[2]) if len(parts) > 2 else 0
+        p1 = proc_info(pid)
     except Exception:
-        cpu_pct = 0
-        rss_kb = 0
+        return {"cpu_pct": 0, "gpu_pct": 0, "memory_gb": 0, "threads": 0}
 
-    # Thread count from proc_info
-    try:
-        info = proc_info(pid)
-        threads = info["threads"]
-        mem_gb = info["real_memory"] / 1e9
-    except Exception:
-        threads = 0
-        mem_gb = rss_kb / 1e6
+    cpu_ns_1 = p1["cpu_ns"]
+    t1 = _time.monotonic_ns()
 
-    # GPU% via GpuMonitor delta
     mon = GpuMonitor(pid=pid, children=True)
     mon.sample()
+
     _time.sleep(interval)
+
+    # Sample 2: proc_info delta
+    try:
+        p2 = proc_info(pid)
+    except Exception:
+        p2 = p1
+
+    cpu_ns_2 = p2["cpu_ns"]
+    t2 = _time.monotonic_ns()
+    wall_ns = t2 - t1
+
+    # CPU% = cpu_ns_delta / wall_ns * 100 (100% = one full core)
+    cpu_pct = (cpu_ns_2 - cpu_ns_1) / max(wall_ns, 1) * 100.0
+    threads = p2["threads"]
+    mem_gb = p2["real_memory"] / 1e9
+
     gpu_pct = mon.sample()
 
     return {
