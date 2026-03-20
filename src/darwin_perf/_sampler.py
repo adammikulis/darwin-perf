@@ -6,10 +6,13 @@ in a background thread and cache the last result for the UI to read.
 
 from __future__ import annotations
 
+import logging
 import threading
 from typing import Any
 
 from ._native import cpu_power, gpu_power
+
+logger = logging.getLogger("darwin_perf.sampler")
 
 
 class PowerSampler:
@@ -22,11 +25,13 @@ class PowerSampler:
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._error_logged = False
 
     def start(self) -> None:
         if self._thread is not None:
             return
         self._stop.clear()
+        self._error_logged = False
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -44,8 +49,11 @@ class PowerSampler:
                 with self._lock:
                     self.cpu = cpu_data
                     self.gpu = gpu_data
-            except Exception:
-                pass
+                self._error_logged = False
+            except Exception as e:
+                if not self._error_logged:
+                    logger.warning("Power sampling error: %s", e)
+                    self._error_logged = True
 
     def get(self) -> tuple[dict[str, Any], dict[str, Any]]:
         """Return (cpu_data, gpu_data) — last cached values."""

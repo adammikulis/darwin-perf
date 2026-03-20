@@ -4,18 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "darwin-perf"
-version = "0.6.0"
-description = "System performance monitoring for macOS Apple Silicon — GPU, CPU, memory, energy, temperature, disk I/O via Mach APIs and AppleSMC. No sudo needed."
+version = "1.1.0"
+description = "Cross-platform system performance monitoring — GPU, CPU, memory, energy, temperature. macOS via Mach APIs, NVIDIA via pynvml, AMD via pyamdgpuinfo, Linux/Windows via /proc and ctypes. No sudo, no psutil."
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
 authors = [{name = "Adam Mikulis"}]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
     "Programming Language :: C",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
@@ -26,12 +28,15 @@ classifiers = [
     "Topic :: System :: Monitoring",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-keywords = ["macos", "darwin", "gpu", "cpu", "monitoring", "performance", "apple-silicon", "metal", "mlx", "pytorch", "mps", "m1", "m2", "m3", "m4", "m5"]
+keywords = ["gpu", "cpu", "monitoring", "performance", "apple-silicon", "nvidia", "amd", "cuda", "metal", "rocm", "pynvml", "mlx", "pytorch", "mps"]
 
 [project.optional-dependencies]
+nvidia = ["pynvml>=12.0"]
+amd = ["pyamdgpuinfo>=2.1"]
 tui = ["textual>=0.40"]
 gui = ["pywebview>=5.0"]
-all = ["textual>=0.40", "pywebview>=5.0"]
+menubar = ["pyobjc-framework-Cocoa>=10.0"]
+all = ["textual>=0.40", "pywebview>=5.0", "pyobjc-framework-Cocoa>=10.0", "pynvml>=12.0"]
 
 [project.scripts]
 darwin-perf = "darwin_perf.cli:main"

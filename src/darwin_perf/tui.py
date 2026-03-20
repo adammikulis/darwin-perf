@@ -21,6 +21,7 @@ from textual.reactive import reactive
 from textual.widgets import Footer, Header, Static
 
 from . import _snapshot
+from ._ids import IDSMonitor
 from ._native import cpu_time_ns, proc_info, system_gpu_stats, system_stats, temperatures
 from ._sampler import PowerSampler
 
@@ -391,6 +392,64 @@ class MemoryPanel(Static):
 
 
 # ---------------------------------------------------------------------------
+# IDS Alerts panel
+# ---------------------------------------------------------------------------
+
+
+class IDSPanel(Static):
+    """Intrusion Detection System alerts panel."""
+
+    def update_ids(self, ids: IDSMonitor) -> None:
+        alerts = ids.alerts
+        baseline = ids.baseline
+
+        # Baseline status
+        status = "[green]warm[/green]" if baseline.is_warm() else "[yellow]cold[/yellow]"
+        samples = baseline._samples
+
+        # Network stats from baseline
+        n_ports = len(baseline.known_listening_ports)
+        n_remotes = len(baseline.known_remote_addrs)
+
+        lines = [
+            f"  [bold]IDS[/bold]  baseline={status} ({samples} samples)"
+            f"  │  known ports={n_ports}  known remotes={n_remotes}",
+        ]
+
+        if not alerts:
+            lines.append("  [dim]No alerts[/dim]")
+        else:
+            recent = alerts[-10:]
+            for a in reversed(recent):
+                from datetime import datetime
+
+                ts = datetime.fromtimestamp(a.timestamp).strftime("%H:%M:%S")
+                sev = a.severity.upper()
+                # Severity coloring
+                if sev == "INFO":
+                    color_open, color_close = "[dim]", "[/dim]"
+                elif sev == "LOW":
+                    color_open, color_close = "[blue]", "[/blue]"
+                elif sev == "MEDIUM":
+                    color_open, color_close = "[yellow]", "[/yellow]"
+                elif sev == "HIGH":
+                    color_open, color_close = "[red]", "[/red]"
+                elif sev == "CRITICAL":
+                    color_open, color_close = "[bold white on red]", "[/bold white on red]"
+                else:
+                    color_open, color_close = "", ""
+
+                # Truncate description to fit
+                desc = a.description[:100]
+                lines.append(
+                    f"  {color_open}[{sev:<8}]{color_close} {ts} "
+                    f"[dim]{a.category}/{a.rule}[/dim]: {desc}"
+                )
+
+        self.update("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
 # Main TUI App
 # ---------------------------------------------------------------------------
 
@@ -449,6 +508,14 @@ class GpuProcApp(App):
     #memory-panel.visible {
         display: block;
     }
+    #ids-panel {
+        padding: 0 1;
+        border-bottom: solid $primary-lighten-2;
+        display: none;
+    }
+    #ids-panel.visible {
+        display: block;
+    }
     #process-list {
         height: 1fr;
         overflow-y: auto;
@@ -468,6 +535,7 @@ class GpuProcApp(App):
         ("g", "toggle_gpu_detail", "GPU detail"),
         ("m", "toggle_memory", "Memory"),
         ("d", "toggle_proc_detail", "Proc detail"),
+        ("i", "toggle_ids", "IDS"),
     ]
 
     def __init__(
@@ -492,6 +560,7 @@ class GpuProcApp(App):
         self._record_count: int = 0
         self._power_sampler = PowerSampler(interval=max(interval, 1.0))
         self._show_proc_detail = False
+        self._ids_monitor: IDSMonitor | None = None
         if record_path:
             self._record_file = open(record_path, "w")
 
@@ -503,6 +572,7 @@ class GpuProcApp(App):
         yield PowerPanel(id="power-panel")
         yield GpuDetailPanel(id="gpu-detail-panel")
         yield MemoryPanel(id="memory-panel")
+        yield IDSPanel(id="ids-panel")
         yield Static(
             "      PID  GPU %  CPU %    Mem  Power  "
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  "
@@ -613,6 +683,10 @@ class GpuProcApp(App):
         mem_panel = self.query_one("#memory-panel", MemoryPanel)
         if mem_panel.has_class("visible"):
             mem_panel.update_memory(sys_mem)
+
+        ids_panel = self.query_one("#ids-panel", IDSPanel)
+        if ids_panel.has_class("visible") and self._ids_monitor is not None:
+            ids_panel.update_ids(self._ids_monitor)
 
         # Write recording line if active
         if self._record_file:
@@ -727,6 +801,19 @@ class GpuProcApp(App):
             row._show_detail = self._show_proc_detail
             row.refresh_display()
 
+    def action_toggle_ids(self) -> None:
+        """Toggle IDS alerts panel. Starts IDSMonitor on first toggle."""
+        panel = self.query_one("#ids-panel", IDSPanel)
+        panel.toggle_class("visible")
+        if panel.has_class("visible"):
+            if self._ids_monitor is None:
+                self._ids_monitor = IDSMonitor(
+                    interval=max(self._interval, 5.0),
+                    enable_llm=False,
+                )
+                self._ids_monitor.start()
+            panel.update_ids(self._ids_monitor)
+
     def action_toggle_record(self) -> None:
         """Toggle recording on/off."""
         if self._record_file:
@@ -745,6 +832,8 @@ class GpuProcApp(App):
 
     def on_unmount(self) -> None:
         self._power_sampler.stop()
+        if self._ids_monitor is not None:
+            self._ids_monitor.stop()
         if self._record_file:
             self._record_file.close()
 
