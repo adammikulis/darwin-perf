@@ -16,6 +16,7 @@ setup(
                 "src/darwin_perf/_net.c",
                 "src/darwin_perf/_sensors.c",
             ],
+            include_dirs=["src/darwin_perf"],
             extra_link_args=["-framework", "IOKit", "-framework", "CoreFoundation"],
             language="c",
         ),
